@@ -19,6 +19,7 @@ import { submitFeedback } from './feedback'
 import type { CrashReportStore } from '../crash-reporting/crash-report-store'
 import {
   getCrashBreadcrumbSnapshot,
+  recordCoalescedCrashBreadcrumb,
   recordCrashBreadcrumb
 } from '../crash-reporting/crash-breadcrumb-store'
 import { startSpan } from '../observability/tracer'
@@ -319,6 +320,26 @@ function buildUncapturedCrashReportText(
   )
 }
 
+// Why: a repeating renderer error (e.g. a ResizeObserver or SSH-rejection
+// storm, #8260) can flush the whole fixed-size breadcrumb ring in seconds,
+// erasing the pre-crash trail. Coalesce repeats into one entry that carries a
+// suppressed count instead.
+const COALESCED_RENDERER_ERROR_BREADCRUMB_NAMES = new Set([
+  'renderer_error',
+  'renderer_unhandled_rejection'
+])
+const RENDERER_ERROR_BREADCRUMB_COALESCE_MS = 30_000
+const RENDERER_ERROR_BREADCRUMB_KEY_MAX_LENGTH = 120
+
+function rendererErrorBreadcrumbCoalesceKey(
+  name: string,
+  data: CrashReportBreadcrumbData | undefined
+): string {
+  const message = data?.message ?? data?.reasonMessage
+  const messageText = typeof message === 'string' ? message : ''
+  return `${name}:${messageText}`.slice(0, RENDERER_ERROR_BREADCRUMB_KEY_MAX_LENGTH)
+}
+
 export function registerCrashReportingHandlers(store: CrashReportStore): void {
   ipcMain.removeHandler('crashReports:getLatestPending')
   ipcMain.handle('crashReports:getLatestPending', () => getLatestPendingReport(store))
@@ -346,7 +367,16 @@ export function registerCrashReportingHandlers(store: CrashReportStore): void {
         return
       }
       const data = sanitizeRendererBreadcrumbData(args.data)
-      recordCrashBreadcrumb(args.name, data)
+      if (COALESCED_RENDERER_ERROR_BREADCRUMB_NAMES.has(args.name)) {
+        recordCoalescedCrashBreadcrumb({
+          name: args.name,
+          data,
+          coalesceKey: rendererErrorBreadcrumbCoalesceKey(args.name, data),
+          minIntervalMs: RENDERER_ERROR_BREADCRUMB_COALESCE_MS
+        })
+      } else {
+        recordCrashBreadcrumb(args.name, data)
+      }
       recordRendererBreadcrumbTrace(args.name, data)
     }
   )
