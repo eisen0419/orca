@@ -108,6 +108,7 @@ import {
   ONBOARDING_FLOW_VERSION,
   ONBOARDING_FINAL_STEP
 } from '../shared/constants'
+import { normalizeTerminalIdleEmptyReclaimMs } from '../shared/terminal-idle-reclaim'
 import { parseWorkspaceSession } from '../shared/workspace-session-schema'
 import { normalizeUsagePercentageDisplay } from '../shared/usage-percentage-display'
 import { normalizeStatusBarUsageMode } from '../shared/status-bar-usage-mode'
@@ -635,6 +636,18 @@ function migrateTerminalArchiveRetentionDays(settings: unknown): {
       : undefined
   const days = normalizeTerminalArchiveRetentionDays(raw)
   return { days, needsSave: raw !== days }
+}
+
+function migrateTerminalIdleEmptyReclaimMs(settings: unknown): {
+  value: number
+  needsSave: boolean
+} {
+  const raw =
+    settings && typeof settings === 'object'
+      ? (settings as { terminalIdleEmptyReclaimMs?: unknown }).terminalIdleEmptyReclaimMs
+      : undefined
+  const value = normalizeTerminalIdleEmptyReclaimMs(raw)
+  return { value, needsSave: raw !== value }
 }
 
 function parseTerminalArchives(raw: unknown): {
@@ -2908,7 +2921,13 @@ export class Store {
         const migratedTerminalArchiveRetention = migrateTerminalArchiveRetentionDays(
           parsed.settings
         )
+        const migratedTerminalIdleEmptyReclaimMs = migrateTerminalIdleEmptyReclaimMs(
+          parsed.settings
+        )
         if (migratedTerminalArchiveRetention.needsSave) {
+          this.loadNeedsSave = true
+        }
+        if (migratedTerminalIdleEmptyReclaimMs.needsSave) {
           this.loadNeedsSave = true
         }
         const parsedTerminalArchives = parseTerminalArchives(parsed.terminalArchivesById)
@@ -3191,6 +3210,9 @@ export class Store {
             floatingTerminalCwdMigratedToAppWorkspace: true,
             terminalScrollbackRows: migratedTerminalScrollback.rows,
             terminalArchiveRetentionDays: migratedTerminalArchiveRetention.days,
+            terminalIdleEmptyReclaimEnabled:
+              parsed.settings?.terminalIdleEmptyReclaimEnabled !== false,
+            terminalIdleEmptyReclaimMs: migratedTerminalIdleEmptyReclaimMs.value,
             terminalQuickCommands: normalizeTerminalQuickCommands(
               parsed.settings?.terminalQuickCommands
             ),
@@ -5339,6 +5361,15 @@ export class Store {
     if ('terminalArchiveRetentionDays' in updates) {
       sanitizedUpdates.terminalArchiveRetentionDays = normalizeTerminalArchiveRetentionDays(
         updates.terminalArchiveRetentionDays
+      )
+    }
+    if ('terminalIdleEmptyReclaimEnabled' in updates) {
+      sanitizedUpdates.terminalIdleEmptyReclaimEnabled =
+        updates.terminalIdleEmptyReclaimEnabled !== false
+    }
+    if ('terminalIdleEmptyReclaimMs' in updates) {
+      sanitizedUpdates.terminalIdleEmptyReclaimMs = normalizeTerminalIdleEmptyReclaimMs(
+        updates.terminalIdleEmptyReclaimMs
       )
     }
     if (

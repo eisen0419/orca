@@ -14,6 +14,7 @@ import { extractLastOsc7Uri, extractOscScanTail } from '../daemon/osc7-uri-extra
 import { parseFileUriPathParts } from '../daemon/osc7-file-uri'
 import type { AgentStatus } from '../../shared/agent-detection'
 import type { TerminalOscLinkRange } from '../../shared/terminal-osc-link-ranges'
+import type { TerminalCreationOrigin } from '../../shared/terminal-idle-reclaim'
 import type { TerminalOscColorQueryReplyColors } from '../../shared/terminal-osc-color-reply'
 import {
   createTerminalTitleTracker,
@@ -1183,12 +1184,19 @@ type RuntimePtyWorktreeRecord = {
   tailLinesTotal: number
   preview: string
   waitBlockedAt: number | null
+  createdAt: number
+  lastInputAt: number | null
+  lastActivityAt: number
+  hasEverReceivedExternalInput: boolean
+  creationOrigin: TerminalCreationOrigin | null
+  activityGeneration: number
   // Why: memoized wait scan of the current retained tail (see RuntimeLeafRecord).
   tailWaitState?: TerminalTailWaitState
 }
 
 type TerminalCreateOptions = {
   command?: string
+  creationOrigin?: TerminalCreationOrigin
   claudeAgentTeamsSourceCommand?: string
   cwd?: string
   env?: Record<string, string>
@@ -1595,6 +1603,8 @@ type RuntimeNotifier = {
       launchToken?: string
       launchAgent?: TuiAgent
       viewMode?: 'terminal' | 'chat'
+      creationOrigin?: TerminalCreationOrigin
+      hasEverReceivedExternalInput?: true
       activate?: boolean
       presentation?: RuntimeTerminalPresentation
       tabId?: string
@@ -3819,7 +3829,26 @@ export class OrcaRuntimeService {
 
     const previousTabs = this.tabs
     const previousLeaves = this.leaves
-    this.tabs = new Map(graph.tabs.map((tab) => [tab.tabId, tab]))
+    this.tabs = new Map(
+      graph.tabs.map((tab) => {
+        const previous = previousTabs.get(tab.tabId)
+        return [
+          tab.tabId,
+          {
+            ...tab,
+            ...(tab.creationOrigin
+              ? {}
+              : previous?.creationOrigin
+                ? { creationOrigin: previous.creationOrigin }
+                : {}),
+            ...(tab.hasEverReceivedExternalInput === true ||
+            previous?.hasEverReceivedExternalInput === true
+              ? { hasEverReceivedExternalInput: true as const }
+              : {})
+          }
+        ]
+      })
+    )
     const lifecycleLeaves = this.reconcileMobileSessionRetirementFences(graph.leaves)
     const changedMobileWorktrees = this.syncMobileSessionTabs(graph.mobileSessionTabs)
     const nextLeaves = new Map<string, RuntimeLeafRecord>()
@@ -3870,13 +3899,20 @@ export class OrcaRuntimeService {
       })
 
       if (leaf.ptyId) {
-        this.recordPtyWorktree(leaf.ptyId, leaf.worktreeId, {
+        const pty = this.recordPtyWorktree(leaf.ptyId, leaf.worktreeId, {
           connected: true,
           lastOutputAt: existing?.ptyId === leaf.ptyId ? existing.lastOutputAt : null,
           preview: existing?.ptyId === leaf.ptyId ? existing.preview : '',
           tabId: leaf.tabId,
           paneKey: this.makeRuntimePaneKey(leaf)
         })
+        const tab = this.tabs.get(leaf.tabId)
+        if (pty.creationOrigin === null && tab?.creationOrigin) {
+          pty.creationOrigin = tab.creationOrigin
+        }
+        if (tab?.hasEverReceivedExternalInput === true) {
+          pty.hasEverReceivedExternalInput = true
+        }
       }
 
       if (existing && (existing.ptyId !== ptyId || existing.ptyGeneration !== ptyGeneration)) {
@@ -7646,6 +7682,10 @@ export class OrcaRuntimeService {
       pty.connected = true
       pty.disconnectedAt = null
       pty.lastOutputAt = at
+      if (data.length > 0) {
+        pty.lastActivityAt = Math.max(pty.lastActivityAt, at)
+        pty.activityGeneration += 1
+      }
       const normalized = normalizeTerminalChunk(data, pty.tailPendingAnsi)
       pty.tailPendingAnsi = normalized.pendingAnsi
       const nextTail = appendNormalizedToTailBuffer(
@@ -13708,6 +13748,7 @@ export class OrcaRuntimeService {
       reserveWrite?: (ptyId: string) => void
       afterWrite?: (ptyId: string) => void | Promise<void>
       suffixFailureError?: string
+      inputKind?: 'external' | 'protocol-reply'
     } = {}
   ): Promise<RuntimeTerminalSend> {
     const pty = this.getLivePtyForHandle(handle)
@@ -13721,6 +13762,7 @@ export class OrcaRuntimeService {
       }
       await assertTerminalInputWithinLimitWithYield(action.text)
       await this.writeTerminalAction(pty.pty.ptyId, action, payload, options)
+      this.recordExternalTerminalInput(pty.pty.ptyId, options.inputKind ?? 'external')
       return {
         handle,
         accepted: true,
@@ -13739,6 +13781,7 @@ export class OrcaRuntimeService {
     await assertTerminalInputWithinLimitWithYield(action.text)
 
     await this.writeTerminalAction(leaf.ptyId, action, payload, options)
+    this.recordExternalTerminalInput(leaf.ptyId, options.inputKind ?? 'external')
 
     return {
       handle,
@@ -13764,6 +13807,7 @@ export class OrcaRuntimeService {
       }
       await assertTerminalInputWithinLimitWithYield(payload)
       await this.writeTerminalAgentPrompt(pty.pty.ptyId, payload, options)
+      this.recordExternalTerminalInput(pty.pty.ptyId, 'external')
       return { handle, accepted: true, bytesWritten }
     }
 
@@ -13773,6 +13817,7 @@ export class OrcaRuntimeService {
     }
     await assertTerminalInputWithinLimitWithYield(payload)
     await this.writeTerminalAgentPrompt(leaf.ptyId, payload, options)
+    this.recordExternalTerminalInput(leaf.ptyId, 'external')
     return { handle, accepted: true, bytesWritten }
   }
 
@@ -21889,6 +21934,15 @@ export class OrcaRuntimeService {
           : null
         pty.launchToken = launchToken ?? null
         pty.launchAgent = launchOpts.launchAgent ?? null
+        pty.creationOrigin = launchOpts.creationOrigin ?? 'user'
+        if (
+          launchOpts.command?.trim() ||
+          effectiveLaunchConfig ||
+          launchOpts.resumeProviderSession ||
+          launchOpts.launchAgent
+        ) {
+          this.recordExternalTerminalInput(result.id, 'external')
+        }
       }
       const handle = pty ? this.issuePtyHandle(pty) : preAllocatedHandle
       if (pty && launchOpts.deferMobileSessionPublish !== true) {
@@ -21920,6 +21974,10 @@ export class OrcaRuntimeService {
             ...(launchToken ? { launchToken } : {}),
             ...(launchOpts.launchAgent ? { launchAgent: launchOpts.launchAgent } : {}),
             ...(launchOpts.viewMode ? { viewMode: launchOpts.viewMode } : {}),
+            creationOrigin: launchOpts.creationOrigin ?? 'user',
+            ...(pty?.hasEverReceivedExternalInput === true
+              ? { hasEverReceivedExternalInput: true as const }
+              : {}),
             activate: presentation === 'focused',
             ...(presentation ? { presentation } : {}),
             tabId,
@@ -22003,6 +22061,13 @@ export class OrcaRuntimeService {
         ...(launchOpts.launchToken ? { launchToken: launchOpts.launchToken } : {}),
         ...(launchOpts.launchAgent ? { launchAgent: launchOpts.launchAgent } : {}),
         ...(launchOpts.viewMode ? { viewMode: launchOpts.viewMode } : {}),
+        creationOrigin: launchOpts.creationOrigin ?? 'user',
+        ...(launchOpts.command?.trim() ||
+        launchOpts.launchConfig ||
+        launchOpts.resumeProviderSession ||
+        launchOpts.launchAgent
+          ? { hasEverReceivedExternalInput: true as const }
+          : {}),
         startupCommandDelivery: launchOpts.startupCommandDelivery,
         title: launchOpts.title,
         activate: presentation === 'focused',
@@ -25167,7 +25232,13 @@ export class OrcaRuntimeService {
         tailTruncated: false,
         tailLinesTotal: 0,
         preview: state.preview ?? '',
-        waitBlockedAt: null
+        waitBlockedAt: null,
+        createdAt: Date.now(),
+        lastInputAt: null,
+        lastActivityAt: Date.now(),
+        hasEverReceivedExternalInput: false,
+        creationOrigin: null,
+        activityGeneration: 0
       }
       if (state.title) {
         this.setPtyManagementTitleFromObservedTitle(pty, state.title, titleObservedAt ?? 0)
@@ -25239,6 +25310,21 @@ export class OrcaRuntimeService {
     return isTerminalLeafId(leaf.leafId)
       ? makePaneKey(leaf.tabId, leaf.leafId)
       : `${leaf.tabId}:${leaf.paneRuntimeId}`
+  }
+
+  recordExternalTerminalInput(ptyId: string, kind: 'external' | 'protocol-reply'): void {
+    if (kind !== 'external') {
+      return
+    }
+    const pty = this.getOrCreatePtyWorktreeRecord(ptyId)
+    if (!pty) {
+      return
+    }
+    const now = Date.now()
+    pty.lastInputAt = now
+    pty.lastActivityAt = Math.max(pty.lastActivityAt, now)
+    pty.hasEverReceivedExternalInput = true
+    pty.activityGeneration += 1
   }
 
   private getOrCreatePtyWorktreeRecord(ptyId: string): RuntimePtyWorktreeRecord | null {

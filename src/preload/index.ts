@@ -16,6 +16,7 @@ import type {
 import type { CliInstallStatus } from '../shared/cli-install-types'
 import type { AgentHookInstallStatus } from '../shared/agent-hook-types'
 import type { TerminalPaneSplitSource } from '../shared/feature-education-telemetry'
+import type { TerminalCreationOrigin } from '../shared/terminal-idle-reclaim'
 import type { ProjectExecutionRuntimeResolution } from '../shared/project-execution-runtime'
 import type { StartupCommandDelivery } from '../shared/codex-startup-delivery'
 import type { TerminalLostWorkerRendererReceipt } from '../shared/terminal-archive-types'
@@ -3536,6 +3537,8 @@ const api = {
         launchToken?: string
         launchAgent?: TuiAgent
         viewMode?: 'terminal' | 'chat'
+        creationOrigin?: TerminalCreationOrigin
+        hasEverReceivedExternalInput?: true
         title?: string
         ptyId?: string
         activate?: boolean
@@ -3560,6 +3563,8 @@ const api = {
           launchToken?: string
           launchAgent?: TuiAgent
           viewMode?: 'terminal' | 'chat'
+          creationOrigin?: TerminalCreationOrigin
+          hasEverReceivedExternalInput?: true
           title?: string
           ptyId?: string
           activate?: boolean

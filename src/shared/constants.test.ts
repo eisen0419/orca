@@ -36,6 +36,12 @@ describe('getDefaultSettings', () => {
     expect(getDefaultSettings('/tmp').terminalCursorStyleDefaultedToBlock).toBe(true)
   })
 
+  it('enables conservative idle-shell reclaim defaults', () => {
+    const settings = getDefaultSettings('/tmp')
+    expect(settings.terminalIdleEmptyReclaimEnabled).toBe(true)
+    expect(settings.terminalIdleEmptyReclaimMs).toBe(60 * 60 * 1000)
+  })
+
   it('enables separate light terminal theme by default', () => {
     expect(getDefaultSettings('/tmp').terminalUseSeparateLightTheme).toBe(true)
   })

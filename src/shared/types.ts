@@ -44,6 +44,7 @@ import type { UsagePercentageDisplay } from './usage-percentage-display'
 import type { StatusBarUsageMode } from './status-bar-usage-mode'
 import type { PersistedNativeChatSessionOptions } from './native-chat-session-options'
 import type { ArchivedTerminalTab, TerminalArchiveHint } from './terminal-archive-types'
+import type { TerminalCreationOrigin } from './terminal-idle-reclaim'
 
 // Re-exported for backward compat with renderer call sites that import
 // `WorkspaceCreateTelemetrySource` from '../../../shared/types'.
@@ -855,6 +856,10 @@ export type TerminalTab = {
   viewMode?: 'terminal' | 'chat'
   sortOrder: number
   createdAt: number
+  /** Optional so sessions written before idle reclaim provenance continue to hydrate. */
+  creationOrigin?: TerminalCreationOrigin
+  /** Monotonic: only the presence of `true` is persisted. */
+  hasEverReceivedExternalInput?: true
   /** Bumped on shutdown so TerminalPane remounts with a fresh PTY. */
   generation?: number
   /** Why: records the shell this tab was opened with (e.g. 'wsl.exe') so the
@@ -2730,6 +2735,8 @@ export type GlobalSettings = {
   terminalScrollbackRows: number
   /** Durable terminal archives expire after this many days; intentionally no infinite-retention mode. */
   terminalArchiveRetentionDays?: number
+  terminalIdleEmptyReclaimEnabled?: boolean
+  terminalIdleEmptyReclaimMs?: number
   /** Optional app-level proxy for Electron networking and local PTYs; empty preserves system/inherited proxy env. */
   httpProxyUrl?: string
   /** Optional semicolon/comma/newline-separated bypass rules for httpProxyUrl. */

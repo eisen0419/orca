@@ -34,12 +34,18 @@ import { DESKTOP_TERMINAL_SCROLLBACK_ROWS_DEFAULT } from './terminal-scrollback-
 import { DEFAULT_USAGE_PERCENTAGE_DISPLAY } from './usage-percentage-display'
 import { DEFAULT_STATUS_BAR_USAGE_MODE } from './status-bar-usage-mode'
 import { DEFAULT_TERMINAL_ARCHIVE_RETENTION_DAYS } from './terminal-archive-types'
+import { DEFAULT_TERMINAL_IDLE_EMPTY_RECLAIM_MS } from './terminal-idle-reclaim'
 
 export {
   DEFAULT_TERMINAL_ARCHIVE_RETENTION_DAYS,
   MAX_TERMINAL_ARCHIVE_RETENTION_DAYS,
   MIN_TERMINAL_ARCHIVE_RETENTION_DAYS
 } from './terminal-archive-types'
+export {
+  DEFAULT_TERMINAL_IDLE_EMPTY_RECLAIM_MS,
+  MAX_TERMINAL_IDLE_EMPTY_RECLAIM_MS,
+  MIN_TERMINAL_IDLE_EMPTY_RECLAIM_MS
+} from './terminal-idle-reclaim'
 
 export { DEFAULT_STATUS_BAR_ITEMS } from './status-bar-defaults'
 export {
@@ -259,6 +265,8 @@ export function getDefaultSettings(homedir: string): GlobalSettings {
     setupScriptLaunchMode: 'new-tab',
     terminalScrollbackRows: DESKTOP_TERMINAL_SCROLLBACK_ROWS_DEFAULT,
     terminalArchiveRetentionDays: DEFAULT_TERMINAL_ARCHIVE_RETENTION_DAYS,
+    terminalIdleEmptyReclaimEnabled: true,
+    terminalIdleEmptyReclaimMs: DEFAULT_TERMINAL_IDLE_EMPTY_RECLAIM_MS,
     httpProxyUrl: '',
     httpProxyBypassRules: '',
     electronHttp1CompatibilityMode: false,

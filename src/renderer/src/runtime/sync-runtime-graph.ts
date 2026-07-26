@@ -592,7 +592,11 @@ async function syncRuntimeGraph(): Promise<void> {
       worktreeId: registeredTab.worktreeId,
       title: resolveRuntimeTerminalTitle(tab, generatedTitlesEnabled),
       activeLeafId: activePaneId === null ? null : (manager?.getLeafId(activePaneId) ?? null),
-      layout: serializePaneTree(root)
+      layout: serializePaneTree(root),
+      ...(tab.creationOrigin ? { creationOrigin: tab.creationOrigin } : {}),
+      ...(tab.hasEverReceivedExternalInput === true
+        ? { hasEverReceivedExternalInput: true as const }
+        : {})
     })
 
     const savedPtyIdsByLeafId = state.terminalLayoutsByTabId[tabId]?.ptyIdsByLeafId ?? {}
@@ -661,7 +665,11 @@ async function syncRuntimeGraph(): Promise<void> {
             console.warn(
               `[sync-runtime-graph] synthesized layout for ${leafCount} unmounted leaves with no saved tree`
             )
-        })
+        }),
+        ...(tab.creationOrigin ? { creationOrigin: tab.creationOrigin } : {}),
+        ...(tab.hasEverReceivedExternalInput === true
+          ? { hasEverReceivedExternalInput: true as const }
+          : {})
       })
       liveLeaves.forEach(([leafId, ptyId], index) => {
         graph.leaves.push({

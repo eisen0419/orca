@@ -959,6 +959,7 @@ const TerminalCreateParams = z.object({
   rendererBacked: z.unknown().optional(),
   activate: z.unknown().optional(),
   presentation: z.enum(['background', 'focused']).optional(),
+  creationOrigin: z.enum(['user', 'cli', 'orchestration']).optional(),
   tabId: OptionalString,
   leafId: OptionalString
 })
@@ -1346,7 +1347,8 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
             ...(reserveWrite ? { reserveWrite } : {}),
             ...(params.inputKind !== 'query-reply' && mobileFloorClientId
               ? { afterWrite: () => commitMobileInputFloorClaim(mobileFloorClaim) }
-              : {})
+              : {}),
+            inputKind: params.inputKind === 'query-reply' ? 'protocol-reply' : 'external'
           }
         )
       } catch (error) {
@@ -1420,6 +1422,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
             rendererBacked: params.rendererBacked === true,
             activate: params.activate === true,
             presentation: params.presentation,
+            creationOrigin: params.creationOrigin ?? 'user',
             tabId: params.tabId,
             leafId: params.leafId,
             ...(preAllocatedHandle ? { preAllocatedHandle } : {})

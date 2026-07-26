@@ -5734,7 +5734,19 @@ export function registerPtyHandlers(
       if (visibleRendererPtys.has(args.id)) {
         clearHiddenRendererResizeOutput(args.id)
       }
-      return writePtyProviderInput(provider, args.id, args.data)
+      const result = writePtyProviderInput(provider, args.id, args.data)
+      if (typeof result === 'boolean') {
+        if (result) {
+          runtime?.recordExternalTerminalInput(args.id, 'external')
+        }
+        return result
+      }
+      return result.then((accepted) => {
+        if (accepted) {
+          runtime?.recordExternalTerminalInput(args.id, 'external')
+        }
+        return accepted
+      })
     } catch {
       return false
     }
@@ -5759,7 +5771,19 @@ export function registerPtyHandlers(
       if (visibleRendererPtys.has(args.id)) {
         clearHiddenRendererResizeOutput(args.id)
       }
-      return writePtyProviderInput(provider, args.id, args.data)
+      const result = writePtyProviderInput(provider, args.id, args.data)
+      if (typeof result === 'boolean') {
+        if (result) {
+          runtime?.recordExternalTerminalInput(args.id, 'external')
+        }
+        return result
+      }
+      return result.then((accepted) => {
+        if (accepted) {
+          runtime?.recordExternalTerminalInput(args.id, 'external')
+        }
+        return accepted
+      })
     } catch {
       return false
     }

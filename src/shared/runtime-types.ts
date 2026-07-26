@@ -26,6 +26,7 @@ import type {
   WorktreeLineageWarning
 } from './types'
 import type { TerminalPaneLayoutNode } from './types'
+import type { TerminalCreationOrigin } from './terminal-idle-reclaim'
 import type {
   RuntimeMarkdownReadTabResult,
   RuntimeMarkdownSaveTabResult
@@ -128,6 +129,8 @@ export type RuntimeSyncedTab = {
   title: string | null
   activeLeafId: string | null
   layout: TerminalPaneLayoutNode | null
+  creationOrigin?: TerminalCreationOrigin
+  hasEverReceivedExternalInput?: true
 }
 
 export type RuntimeSyncedLeaf = {
@@ -621,6 +624,8 @@ type RuntimeTerminalCreateBaseRequestPayload = {
   title?: string
   activate?: boolean
   presentation?: RuntimeTerminalPresentation
+  creationOrigin?: TerminalCreationOrigin
+  hasEverReceivedExternalInput?: true
 }
 
 export type RuntimeTerminalCreateRequestPayload =

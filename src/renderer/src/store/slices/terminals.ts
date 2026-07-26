@@ -41,6 +41,7 @@ import {
 import { isWslUncPath } from '../../../../shared/wsl-paths'
 import type { ProjectExecutionRuntimeResolution } from '../../../../shared/project-execution-runtime'
 import type { StartupCommandDelivery } from '../../../../shared/codex-startup-delivery'
+import type { TerminalCreationOrigin } from '../../../../shared/terminal-idle-reclaim'
 import type { SessionOptionValue } from '../../../../shared/native-chat-session-options'
 import { resolveLocalWindowsTerminalShellOverrideForTab } from '../../../../shared/local-windows-terminal-runtime'
 import { WINDOWS_GIT_BASH_SHELL } from '../../../../shared/windows-terminal-shell'
@@ -560,6 +561,8 @@ export type TerminalSlice = {
     options?: {
       pendingActivationSpawn?: boolean
       initialPtyId?: string
+      creationOrigin?: TerminalCreationOrigin
+      hasEverReceivedExternalInput?: true
       activate?: boolean
       recordInteraction?: boolean
       /** Pre-allocated tab id (main mints it for CLI/runtime PTYs with a baked pane key); minted fresh on omit or cross-worktree collision. */
@@ -964,6 +967,10 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
         color: null,
         sortOrder: existing.length,
         createdAt: Date.now(),
+        creationOrigin: options?.creationOrigin ?? 'user',
+        ...(options?.hasEverReceivedExternalInput === true
+          ? { hasEverReceivedExternalInput: true as const }
+          : {}),
         ...(createdShellOverride !== undefined ? { shellOverride: createdShellOverride } : {}),
         ...(startupCwd && startupCwd.length > 0 ? { startupCwd } : {}),
         ...(options?.launchAgent ? { launchAgent: options.launchAgent } : {}),

@@ -1491,6 +1491,8 @@ export function useIpcEvents(): void {
           launchToken,
           launchAgent,
           viewMode,
+          creationOrigin,
+          hasEverReceivedExternalInput,
           title,
           ptyId,
           activate,
@@ -1542,6 +1544,10 @@ export function useIpcEvents(): void {
                 ? store.createTab(worktreeId, undefined, undefined, {
                     initialPtyId: ptyId,
                     activate: shouldActivate,
+                    ...(creationOrigin ? { creationOrigin } : {}),
+                    ...(hasEverReceivedExternalInput === true
+                      ? { hasEverReceivedExternalInput: true as const }
+                      : {}),
                     ...(launchAgent
                       ? {
                           launchAgent,
@@ -1775,7 +1781,13 @@ export function useIpcEvents(): void {
                   recordInteraction: false,
                   ...(data.cwd ? { startupCwd: data.cwd } : {})
                 }
-          const tab = store.createTab(worktreeId, data.targetGroupId, undefined, tabOptions)
+          const tab = store.createTab(worktreeId, data.targetGroupId, undefined, {
+            ...tabOptions,
+            ...(data.creationOrigin ? { creationOrigin: data.creationOrigin } : {}),
+            ...(data.hasEverReceivedExternalInput === true
+              ? { hasEverReceivedExternalInput: true as const }
+              : {})
+          })
           if (!shouldActivate) {
             // Why: renderer-backed Codex startup must mount its new TerminalPane without switching UI or connecting every saved tab.
             requestBackgroundTerminalWorktreeMount({ worktreeId, tabIds: [tab.id] })

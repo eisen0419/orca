@@ -66,6 +66,7 @@ import type {
   OrcaProfileOrgMembersListResult
 } from '../shared/orca-profiles'
 import type { TerminalPaneSplitSource } from '../shared/feature-education-telemetry'
+import type { TerminalCreationOrigin } from '../shared/terminal-idle-reclaim'
 import type { TaskSourceContext } from '../shared/task-source-context'
 import type { LinearIssueAttributeFilter } from '../shared/linear-issue-attribute-filter'
 import type { ProjectExecutionRuntimeResolution } from '../shared/project-execution-runtime'
@@ -2948,6 +2949,8 @@ export type PreloadApi = {
         launchToken?: string
         launchAgent?: TuiAgent
         viewMode?: 'terminal' | 'chat'
+        creationOrigin?: TerminalCreationOrigin
+        hasEverReceivedExternalInput?: true
         title?: string
         ptyId?: string
         activate?: boolean

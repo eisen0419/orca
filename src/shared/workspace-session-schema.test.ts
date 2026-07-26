@@ -51,6 +51,68 @@ describe('parseWorkspaceSession', () => {
     expect(result.ok).toBe(true)
   })
 
+  it('round-trips optional terminal reclaim facts and tolerates legacy records', () => {
+    const base = {
+      activeRepoId: null,
+      activeWorktreeId: null,
+      activeTabId: null,
+      terminalLayoutsByTabId: {}
+    }
+    const current = parseWorkspaceSession({
+      ...base,
+      tabsByWorktree: {
+        wt: [
+          {
+            id: 'tab-current',
+            ptyId: null,
+            worktreeId: 'wt',
+            title: 'Terminal',
+            customTitle: null,
+            color: null,
+            sortOrder: 0,
+            createdAt: 1,
+            creationOrigin: 'cli',
+            hasEverReceivedExternalInput: true
+          }
+        ]
+      }
+    })
+    const legacy = parseWorkspaceSession({ ...base, tabsByWorktree: { wt: [] } })
+    expect(current.ok).toBe(true)
+    expect(legacy.ok).toBe(true)
+    if (current.ok) {
+      expect(current.value.tabsByWorktree.wt[0]).toMatchObject({
+        creationOrigin: 'cli',
+        hasEverReceivedExternalInput: true
+      })
+    }
+  })
+
+  it('rejects an invalid terminal creation origin without accepting a corrupted session', () => {
+    const result = parseWorkspaceSession({
+      activeRepoId: null,
+      activeWorktreeId: null,
+      activeTabId: null,
+      terminalLayoutsByTabId: {},
+      tabsByWorktree: {
+        wt: [
+          {
+            id: 'tab-invalid',
+            ptyId: null,
+            worktreeId: 'wt',
+            title: 'Terminal',
+            customTitle: null,
+            color: null,
+            sortOrder: 0,
+            createdAt: 1,
+            creationOrigin: 'external-script'
+          }
+        ]
+      }
+    })
+    expect(result.ok).toBe(false)
+  })
+
   it('preserves an isolated browser tab session partition across hydration', () => {
     // Regression for #6923: the resolved partition must survive persist→load,
     // otherwise a restored isolated tab falls back to the shared default

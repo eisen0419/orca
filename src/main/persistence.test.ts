@@ -4888,6 +4888,18 @@ describe('Store', () => {
     expect(persisted.settings).not.toHaveProperty('terminalScrollbackBytes')
   })
 
+  it('normalizes idle empty-shell reclaim settings on update', async () => {
+    const store = await createStore()
+
+    const updated = store.updateSettings({
+      terminalIdleEmptyReclaimEnabled: false,
+      terminalIdleEmptyReclaimMs: 1 as never
+    })
+
+    expect(updated.terminalIdleEmptyReclaimEnabled).toBe(false)
+    expect(updated.terminalIdleEmptyReclaimMs).toBe(5 * 60 * 1000)
+  })
+
   it('normalizes disabled TUI agents on load and update', async () => {
     writeFileSync(
       join(testState.dir, 'orca-data.json'),

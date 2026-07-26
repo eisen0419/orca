@@ -20,7 +20,7 @@ export type CoordinatorRuntime = {
   }>
   createTerminal(
     worktreeSelector?: string,
-    opts?: { command?: string; title?: string }
+    opts?: { command?: string; title?: string; creationOrigin?: 'orchestration' }
   ): Promise<{ handle: string; worktreeId: string }>
   waitForTerminal(
     handle: string,
@@ -396,7 +396,8 @@ export class Coordinator {
       // Why: create at most one terminal per tick to avoid spawning many at once.
       try {
         const created = await this.runtime.createTerminal(this.opts.worktree, {
-          title: `Worker: ${readyTasks[0].spec.slice(0, 40)}`
+          title: `Worker: ${readyTasks[0].spec.slice(0, 40)}`,
+          creationOrigin: 'orchestration'
         })
         terminals.push(created.handle)
         this.opts.onLog(`Created worker terminal ${created.handle}`)

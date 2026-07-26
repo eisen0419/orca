@@ -78,6 +78,8 @@ const terminalTabSchema = z.object({
   isPinned: z.boolean().optional(),
   sortOrder: z.number(),
   createdAt: z.number(),
+  creationOrigin: z.enum(['user', 'cli', 'orchestration']).optional(),
+  hasEverReceivedExternalInput: z.literal(true).optional(),
   generation: z.number().optional(),
   startupCwd: z.string().min(1).optional(),
   // Why: persist the launched agent so a restored idle agent tab keeps its
