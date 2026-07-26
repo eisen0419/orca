@@ -38,6 +38,8 @@ type RuntimeIdleReclaimInternals = {
   tabs: Map<string, unknown>
   leaves: Map<string, unknown>
   graphStatus: 'unavailable' | 'reloading' | 'ready'
+  launchFactsAuthoritativeIncarnationByPtyId: Map<string, string | null>
+  dropDisconnectedPtyRecord: (ptyId: string) => void
 }
 
 function makeStore(enabled: boolean, session: WorkspaceSessionState | null = null) {
@@ -309,12 +311,46 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
     runtime.dispose()
   })
 
-  it('finds a dispatch retained under a stale handle through its pane key', async () => {
+  it('does not double-count a remote session that corroborates a layout binding', async () => {
+    const session = getDefaultWorkspaceSession()
+    session.tabsByWorktree[WORKTREE_ID] = [persistedTerminalTab()]
+    session.terminalLayoutsByTabId[TAB_ID] = {
+      root: { type: 'leaf', leafId: LEAF_ID },
+      activeLeafId: LEAF_ID,
+      expandedLeafId: null,
+      ptyIdsByLeafId: { [LEAF_ID]: 'pty-remote-session' }
+    }
+    session.remoteSessionIdsByTabId = { [TAB_ID]: 'pty-remote-session' }
+    const runtime = new OrcaRuntimeService(makeStore(true, session) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
+    })
+    const pty = internals.recordPtyWorktree('pty-remote-session', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'remote-session-incarnation',
+      tabId: TAB_ID,
+      paneKey: PANE_KEY
+    })
+    pty.creationOrigin = 'cli'
+
+    const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(candidate).toMatchObject({ isPersisted: true, hasSharedPty: false })
+    runtime.dispose()
+  })
+
+  it('finds a dispatch after its tab id is reminted through its stable leaf id', async () => {
     const runtime = new OrcaRuntimeService(makeStore(true) as never)
     const internals = runtime as unknown as RuntimeIdleReclaimInternals
     internals.graphStatus = 'ready'
     const getActiveDispatchAssignees = vi.fn(() => [
-      { assignee_handle: 'term_stale', assignee_pane_key: PANE_KEY }
+      { assignee_handle: 'term_stale', assignee_pane_key: `${RUNTIME_TAB_ID}:${LEAF_ID}` }
     ])
     runtime.setOrchestrationDb({
       getActiveCoordinatorRun: vi.fn(() => undefined),
@@ -437,10 +473,71 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
     runtime.dispose()
   })
 
-  it('caps provider inspection candidates and reports aggregate truncation', async () => {
+  it('revokes and clears incarnation-bound launch authority across replacement and pruning', async () => {
     const runtime = new OrcaRuntimeService(makeStore(true) as never)
     const internals = runtime as unknown as RuntimeIdleReclaimInternals
-    const inspectProcess = vi.fn(async () => ({
+    internals.graphStatus = 'ready'
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
+    })
+    runtime.onPtySpawned('pty-authority', 'authority-incarnation-1', {
+      awaitsRegistration: false
+    })
+    const pty = internals.recordPtyWorktree('pty-authority', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'authority-incarnation-1',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    internals.recordPtyWorktree('pty-authority', WORKTREE_ID, {
+      incarnationId: 'authority-incarnation-2'
+    })
+    const [replacedCandidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(replacedCandidate).toMatchObject({
+      hasPendingRestoreOrReconnect: null,
+      hasStartupCommand: null,
+      hasLaunchConfig: null,
+      hasResumeProviderSession: null,
+      hasLaunchAgent: null
+    })
+    expect(internals.launchFactsAuthoritativeIncarnationByPtyId.has('pty-authority')).toBe(false)
+
+    runtime.onPtySpawned('pty-authority', 'authority-incarnation-2', {
+      awaitsRegistration: false
+    })
+    internals.dropDisconnectedPtyRecord('pty-authority')
+
+    expect(internals.launchFactsAuthoritativeIncarnationByPtyId.size).toBe(0)
+    const reconstructed = internals.recordPtyWorktree('pty-authority', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'authority-incarnation-2',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    reconstructed.creationOrigin = 'cli'
+    const [reconstructedCandidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(reconstructedCandidate).toMatchObject({
+      hasPendingRestoreOrReconnect: null,
+      hasStartupCommand: null,
+      hasLaunchConfig: null,
+      hasResumeProviderSession: null,
+      hasLaunchAgent: null
+    })
+    runtime.dispose()
+  })
+
+  it('rotates the bounded provider-inspection budget and reports aggregate truncation', async () => {
+    const runtime = new OrcaRuntimeService(makeStore(true) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    const inspectProcess = vi.fn(async (_ptyId: string) => ({
       foregroundProcess: 'zsh',
       hasChildProcesses: false
     }))
@@ -462,11 +559,49 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
 
     await internals.tickIdleEmptyTerminalReclaim()
+    await internals.tickIdleEmptyTerminalReclaim()
 
-    expect(inspectProcess).toHaveBeenCalledTimes(64)
-    expect(debug).toHaveBeenCalledWith(
+    expect(inspectProcess).toHaveBeenCalledTimes(128)
+    expect(new Set(inspectProcess.mock.calls.map(([ptyId]) => ptyId)).size).toBe(65)
+    expect(inspectProcess.mock.calls[0]?.[0]).toBe('pty-budget-0')
+    expect(inspectProcess.mock.calls[63]?.[0]).toBe('pty-budget-63')
+    expect(inspectProcess.mock.calls[64]?.[0]).toBe('pty-budget-64')
+    expect(debug).toHaveBeenLastCalledWith(
       '[idle-empty-terminal-reclaim] tick decisions',
       expect.objectContaining({ candidateCount: 64, truncatedCandidateCount: 1 })
+    )
+    runtime.dispose()
+  })
+
+  it('stops snapshot collection when its cooperative budget is exhausted', async () => {
+    const runtime = new OrcaRuntimeService(makeStore(true) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    const inspectProcess = vi.fn(async () => ({
+      foregroundProcess: 'zsh',
+      hasChildProcesses: false
+    }))
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess
+    })
+    internals.recordPtyWorktree('pty-snapshot-budget', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'snapshot-budget-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValue(50)
+
+    await internals.tickIdleEmptyTerminalReclaim()
+
+    expect(inspectProcess).not.toHaveBeenCalled()
+    expect(debug).toHaveBeenCalledWith(
+      '[idle-empty-terminal-reclaim] tick decisions',
+      expect.objectContaining({ candidateCount: 0, truncatedCandidateCount: 1 })
     )
     runtime.dispose()
   })
