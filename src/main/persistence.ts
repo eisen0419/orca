@@ -3244,7 +3244,7 @@ export class Store {
             terminalScrollbackRows: migratedTerminalScrollback.rows,
             terminalArchiveRetentionDays: migratedTerminalArchiveRetention.days,
             terminalIdleEmptyReclaimEnabled:
-              parsed.settings?.terminalIdleEmptyReclaimEnabled !== false,
+              parsed.settings?.terminalIdleEmptyReclaimEnabled === true,
             terminalIdleEmptyReclaimMs: migratedTerminalIdleEmptyReclaimMs.value,
             terminalQuickCommands: normalizeTerminalQuickCommands(
               parsed.settings?.terminalQuickCommands

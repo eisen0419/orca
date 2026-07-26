@@ -9,6 +9,7 @@ import {
   isShellProcess,
   normalizeTerminalTitle
 } from '../../shared/agent-detection'
+import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from 'node:timers'
 import { extractOscTitleScanTail } from '../../shared/osc-title-scan-tail'
 import { extractLastOsc7Uri, extractOscScanTail } from '../daemon/osc7-uri-extraction'
 import { parseFileUriPathParts } from '../daemon/osc7-file-uri'
@@ -16,6 +17,16 @@ import type { AgentStatus } from '../../shared/agent-detection'
 import type { TerminalOscLinkRange } from '../../shared/terminal-osc-link-ranges'
 import type { TerminalCreationOrigin } from '../../shared/terminal-idle-reclaim'
 import type { TerminalOscColorQueryReplyColors } from '../../shared/terminal-osc-color-reply'
+import { IdleEmptyTerminalReclaimScheduler } from '../idle-empty-terminal-reclaim-scheduler'
+import {
+  collectIdleEmptyTerminalReclaimCandidates,
+  type IdleEmptyTerminalReclaimCandidateSnapshot
+} from './idle-empty-terminal-reclaim-collector'
+import {
+  evaluateIdleReclaimCandidate,
+  type IdleEmptyTerminalReclaimInspection,
+  type IdleEmptyTerminalReclaimRefusalReason
+} from './idle-empty-terminal-reclaim'
 import {
   createTerminalTitleTracker,
   stripBrailleSpinnerGlyphs,
@@ -1018,6 +1029,8 @@ type RuntimeStore = {
     agentDefaultArgs?: GlobalSettings['agentDefaultArgs']
     agentDefaultEnv?: GlobalSettings['agentDefaultEnv']
     terminalWindowsShell?: GlobalSettings['terminalWindowsShell']
+    terminalIdleEmptyReclaimEnabled?: GlobalSettings['terminalIdleEmptyReclaimEnabled']
+    terminalIdleEmptyReclaimMs?: GlobalSettings['terminalIdleEmptyReclaimMs']
     floatingTerminalEnabled?: GlobalSettings['floatingTerminalEnabled']
     agentStatusHooksEnabled?: GlobalSettings['agentStatusHooksEnabled']
     defaultTaskSource?: GlobalSettings['defaultTaskSource']
@@ -2589,6 +2602,13 @@ export class OrcaRuntimeService {
   // iterates them all. Listeners are cleaned up via subscriptionCleanups.
   private notificationListeners = new Set<(event: MobileNotificationEvent) => void>()
   private ptysById = new Map<string, RuntimePtyWorktreeRecord>()
+  private readonly idleEmptyTerminalReclaimScheduler = new IdleEmptyTerminalReclaimScheduler(
+    () => this.tickIdleEmptyTerminalReclaim(),
+    {
+      schedule: (callback, delay) => setNativeTimeout(callback, delay),
+      cancel: (timer) => clearNativeTimeout(timer)
+    }
+  )
   private wslDistroByPtyId = new Map<string, string>()
   private titleObservationSequence = 0
   private headlessTerminals = new Map<string, RuntimeHeadlessTerminal>()
@@ -2998,6 +3018,218 @@ export class OrcaRuntimeService {
         state.emulator.applyPushedViewAttributes(attributes)
       }
     })
+    this.idleEmptyTerminalReclaimScheduler.start()
+  }
+
+  dispose(): void {
+    this.idleEmptyTerminalReclaimScheduler.dispose()
+  }
+
+  private async tickIdleEmptyTerminalReclaim(): Promise<void> {
+    const settings = this.store?.getSettings()
+    const config = {
+      enabled: settings?.terminalIdleEmptyReclaimEnabled,
+      idleThresholdMs: settings?.terminalIdleEmptyReclaimMs
+    }
+    if (config.enabled !== true) {
+      console.debug('[idle-empty-terminal-reclaim] tick skipped: feature disabled')
+      return
+    }
+
+    const candidates = await this.collectIdleEmptyTerminalReclaimCandidates()
+    const refusalCounts = new Map<IdleEmptyTerminalReclaimRefusalReason, number>()
+    const eligibleCloseModes = new Map<string, number>()
+    for (const candidate of candidates) {
+      const decision = evaluateIdleReclaimCandidate(candidate, config, Date.now())
+      if (decision.eligible) {
+        eligibleCloseModes.set(
+          decision.closeMode,
+          (eligibleCloseModes.get(decision.closeMode) ?? 0) + 1
+        )
+      } else {
+        refusalCounts.set(decision.reason, (refusalCounts.get(decision.reason) ?? 0) + 1)
+      }
+    }
+    console.debug('[idle-empty-terminal-reclaim] tick decisions', {
+      candidateCount: candidates.length,
+      refusalCounts: Object.fromEntries(refusalCounts),
+      eligibleCount: [...eligibleCloseModes.values()].reduce((total, count) => total + count, 0),
+      eligibleCloseModes: Object.fromEntries(eligibleCloseModes)
+    })
+  }
+
+  private async collectIdleEmptyTerminalReclaimCandidates() {
+    const snapshots = [...this.ptysById.values()].map((pty) =>
+      this.collectIdleEmptyTerminalReclaimCandidateSnapshot(pty)
+    )
+    return await collectIdleEmptyTerminalReclaimCandidates(
+      snapshots,
+      async (ptyId) => await this.inspectIdleEmptyTerminalReclaimPty(ptyId)
+    )
+  }
+
+  private collectIdleEmptyTerminalReclaimCandidateSnapshot(
+    pty: RuntimePtyWorktreeRecord
+  ): IdleEmptyTerminalReclaimCandidateSnapshot {
+    const pane = parsePaneKey(pty.paneKey ?? '')
+    const tabId = pty.tabId ?? pane?.tabId ?? null
+    const leafId = pane?.leafId ?? null
+    const session = this.getWorkspaceSessionForWorktree(pty.worktreeId)
+    const persistedTab = tabId
+      ? session?.tabsByWorktree[pty.worktreeId]?.find((tab) => tab.id === tabId)
+      : undefined
+    const persistedLayout = tabId ? session?.terminalLayoutsByTabId[tabId] : undefined
+    const persistedPtyId = leafId ? persistedLayout?.ptyIdsByLeafId?.[leafId] : undefined
+    const hasExactPersistedBinding =
+      Boolean(persistedTab) &&
+      Boolean(persistedLayout) &&
+      persistedPtyId === pty.ptyId &&
+      tabId === pane?.tabId
+    const isPersisted =
+      persistedTab === undefined
+        ? false
+        : persistedLayout === undefined || !leafId || persistedPtyId !== pty.ptyId
+          ? null
+          : true
+
+    const rendererTab = tabId ? this.tabs.get(tabId) : undefined
+    const rendererLeaf =
+      tabId && leafId ? this.leaves.get(this.getLeafKey(tabId, leafId)) : undefined
+    const hasExactRendererBinding =
+      rendererTab?.worktreeId === pty.worktreeId &&
+      rendererLeaf?.worktreeId === pty.worktreeId &&
+      rendererLeaf.ptyId === pty.ptyId
+    const rendererOwnsPersistedTab =
+      isPersisted === true
+        ? hasExactRendererBinding
+          ? true
+          : rendererTab === undefined && rendererLeaf === undefined
+            ? false
+            : null
+        : isPersisted === false
+          ? rendererTab === undefined && rendererLeaf === undefined
+            ? false
+            : hasExactRendererBinding
+              ? true
+              : null
+          : null
+    const persistedLeafIds = this.collectPersistedTerminalLeafIds(persistedLayout)
+    const rendererLeafCount = rendererTab?.layout
+      ? countTerminalPaneLayoutLeaves(rendererTab.layout)
+      : null
+    const isSinglePane =
+      isPersisted === true
+        ? persistedLeafIds.length === 1
+        : hasExactRendererBinding
+          ? rendererLeafCount === 1
+          : null
+    const persistedPtyReferences = Object.values(persistedLayout?.ptyIdsByLeafId ?? {}).filter(
+      (ptyId) => ptyId === pty.ptyId
+    ).length
+    const rendererPtyReferences = [...this.leaves.values()].filter(
+      (leaf) => leaf.ptyId === pty.ptyId
+    ).length
+    const hasSharedPty =
+      isPersisted === true
+        ? persistedPtyReferences > 1
+        : hasExactRendererBinding
+          ? rendererPtyReferences > 1
+          : null
+    const latestAgentStatus = pane
+      ? this.latestAgentStatusByPaneKey.get(makePaneKey(pane.tabId, pane.leafId))?.payload.state
+      : undefined
+    const handle = this.handleByPtyId.get(pty.ptyId) ?? this.findHandleForPtyRecord(pty.ptyId)
+    const activeDispatch = handle
+      ? this._orchestrationDb?.getActiveDispatchForTerminal?.(handle)
+      : undefined
+    const activeCoordinator = Boolean(
+      handle && this._orchestrationDb?.getActiveCoordinatorRun?.()?.coordinator_handle === handle
+    )
+    const hasMobileSubscriber =
+      (this.mobileSubscribers.get(pty.ptyId)?.size ?? 0) > 0 ||
+      this.pendingSoftLeavers.has(pty.ptyId)
+
+    return {
+      tabId,
+      leafId,
+      ptyId: pty.ptyId,
+      worktreeId: pty.worktreeId,
+      incarnationId: pty.incarnationId,
+      expectedIncarnationId: pty.incarnationId,
+      activityGeneration: pty.activityGeneration,
+      expectedActivityGeneration: pty.activityGeneration,
+      isSinglePane,
+      hasExactTabLeafPtyWorktreeBinding:
+        hasExactPersistedBinding || hasExactRendererBinding
+          ? true
+          : isPersisted === false && rendererOwnsPersistedTab === false && Boolean(tabId && leafId)
+            ? true
+            : null,
+      hasSharedPty,
+      isPersisted,
+      rendererOwnsPersistedTab,
+      origin: pty.creationOrigin,
+      used: pty.hasEverReceivedExternalInput,
+      isPinned: isPersisted === true ? persistedTab?.isPinned === true : null,
+      isSleepingOrHibernating:
+        isPersisted === true && pane
+          ? Boolean(session?.sleepingAgentSessionsByPaneKey?.[makePaneKey(pane.tabId, pane.leafId)])
+          : null,
+      hasPendingRestoreOrReconnect: this.pendingRestoreTimers.has(pty.ptyId) ? true : null,
+      hasStartupCommand: this.terminalSpawnCommandsByPtyId.has(pty.ptyId),
+      hasLaunchConfig: pty.launchConfig !== null,
+      hasResumeProviderSession: null,
+      hasLaunchAgent: pty.launchAgent !== null,
+      hasForegroundAgent: pty.foregroundAgent !== null,
+      agentStatus: latestAgentStatus ?? 'none',
+      hasProviderSession: null,
+      hasOrchestrationOwnership: Boolean(activeDispatch) || activeCoordinator,
+      lastActivityAt: pty.lastActivityAt,
+      providerConnected: pty.connected,
+      providerWritable: rendererLeaf ? rendererLeaf.writable : null,
+      rendererVisibility: null,
+      hasMobileDriver: this.getDriver(pty.ptyId).kind === 'mobile',
+      hasMobileSubscriber,
+      hasRemoteDesktopViewer: this.hasRemoteDesktopViewers(pty.ptyId),
+      isActiveCoordinatorHandle: activeCoordinator,
+      hasPendingOrDispatchedContext: Boolean(activeDispatch),
+      hasInFlightTransaction: false,
+      hasSecondConfirmation: null,
+      hasExactIdentityClaim: null
+    }
+  }
+
+  private async inspectIdleEmptyTerminalReclaimPty(
+    ptyId: string
+  ): Promise<IdleEmptyTerminalReclaimInspection> {
+    const controller = this.ptyController
+    if (!controller) {
+      return null
+    }
+    try {
+      const inspection = controller.inspectProcess
+        ? await controller.inspectProcess(ptyId)
+        : controller.hasChildProcesses
+          ? {
+              foregroundProcess: await controller.getForegroundProcess(ptyId),
+              hasChildProcesses: await controller.hasChildProcesses(ptyId)
+            }
+          : null
+      if (!inspection) {
+        return null
+      }
+      return {
+        status: 'success',
+        foregroundProcess: inspection.foregroundProcess
+          ? isShellProcess(inspection.foregroundProcess)
+            ? 'shell'
+            : 'other'
+          : null,
+        hasChildProcesses: inspection.hasChildProcesses
+      }
+    } catch {
+      return { status: 'error', foregroundProcess: null, hasChildProcesses: null }
+    }
   }
 
   getLocalProvider(): IPtyProvider | null {
@@ -32325,6 +32557,12 @@ function buildTerminalWait(
 
 function getPtyTerminalState(pty: RuntimePtyWorktreeRecord): RuntimeTerminalState {
   return pty.connected ? 'running' : pty.lastExitCode !== null ? 'exited' : 'unknown'
+}
+
+function countTerminalPaneLayoutLeaves(node: TerminalPaneLayoutNode): number {
+  return node.type === 'leaf'
+    ? 1
+    : countTerminalPaneLayoutLeaves(node.first) + countTerminalPaneLayoutLeaves(node.second)
 }
 
 function branchSelectorMatches(branch: string, selector: string): boolean {

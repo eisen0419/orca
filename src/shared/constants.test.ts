@@ -36,9 +36,9 @@ describe('getDefaultSettings', () => {
     expect(getDefaultSettings('/tmp').terminalCursorStyleDefaultedToBlock).toBe(true)
   })
 
-  it('enables conservative idle-shell reclaim defaults', () => {
+  it('keeps idle-shell reclaim disabled by default', () => {
     const settings = getDefaultSettings('/tmp')
-    expect(settings.terminalIdleEmptyReclaimEnabled).toBe(true)
+    expect(settings.terminalIdleEmptyReclaimEnabled).toBe(false)
     expect(settings.terminalIdleEmptyReclaimMs).toBe(60 * 60 * 1000)
   })
 

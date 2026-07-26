@@ -265,7 +265,7 @@ export function getDefaultSettings(homedir: string): GlobalSettings {
     setupScriptLaunchMode: 'new-tab',
     terminalScrollbackRows: DESKTOP_TERMINAL_SCROLLBACK_ROWS_DEFAULT,
     terminalArchiveRetentionDays: DEFAULT_TERMINAL_ARCHIVE_RETENTION_DAYS,
-    terminalIdleEmptyReclaimEnabled: true,
+    terminalIdleEmptyReclaimEnabled: false,
     terminalIdleEmptyReclaimMs: DEFAULT_TERMINAL_IDLE_EMPTY_RECLAIM_MS,
     httpProxyUrl: '',
     httpProxyBypassRules: '',
