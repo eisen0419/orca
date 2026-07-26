@@ -97,6 +97,45 @@ describe('runtime terminal registration ownership', () => {
 })
 
 describe('scheduleRuntimeGraphSync', () => {
+  it('publishes provenance and the monotonic used fact for mounted tabs', async () => {
+    vi.useFakeTimers()
+    const syncWindowGraph = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('window', { api: { runtime: { syncWindowGraph } } })
+    vi.stubGlobal('HTMLElement', class HTMLElement {})
+    const unregister = registerRuntimeTerminalTab({
+      tabId: 'term-1',
+      worktreeId: 'wt-1',
+      getManager: () => null,
+      getContainer: () => null,
+      getPtyIdForPane: () => null
+    })
+    setRuntimeGraphStoreStateGetter(() =>
+      makeState({
+        tabsByWorktree: {
+          'wt-1': [
+            {
+              ...makeTerminalTab(),
+              creationOrigin: 'orchestration',
+              hasEverReceivedExternalInput: true
+            }
+          ]
+        } as AppState['tabsByWorktree']
+      })
+    )
+
+    setRuntimeGraphSyncEnabled(true)
+    await flushRuntimeGraphSyncTimer()
+
+    expect(syncWindowGraph.mock.calls[0]?.[0].tabs).toEqual([
+      expect.objectContaining({
+        tabId: 'term-1',
+        creationOrigin: 'orchestration',
+        hasEverReceivedExternalInput: true
+      })
+    ])
+    unregister()
+  })
+
   it('coalesces updates that arrive while the runtime graph IPC is in flight', async () => {
     vi.useFakeTimers()
     const syncCalls: {

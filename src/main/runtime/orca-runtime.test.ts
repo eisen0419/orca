@@ -1616,6 +1616,75 @@ describe('OrcaRuntimeService.dedupeWorktreeCreate', () => {
 })
 
 describe('OrcaRuntimeService', () => {
+  it('records only external successful writes as terminal use', async () => {
+    const runtime = new OrcaRuntimeService(store)
+    runtime.setPtyController({
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+    syncSinglePty(runtime)
+    const [terminal] = (await runtime.listTerminals()).terminals
+    const internals = runtime as unknown as {
+      ptysById: Map<string, { hasEverReceivedExternalInput: boolean }>
+    }
+
+    await runtime.sendTerminal(
+      terminal.handle,
+      { text: '\x1b[3;4R', enter: false },
+      { inputKind: 'protocol-reply' }
+    )
+    expect(internals.ptysById.get('pty-1')?.hasEverReceivedExternalInput).toBe(false)
+
+    await runtime.sendTerminal(terminal.handle, { text: 'real command', enter: true })
+    expect(internals.ptysById.get('pty-1')?.hasEverReceivedExternalInput).toBe(true)
+  })
+
+  it('preserves graph provenance and the used fact when a stale graph omits them', () => {
+    const runtime = new OrcaRuntimeService(store)
+    const graph = (tab: Record<string, unknown>) => ({
+      tabs: [
+        {
+          tabId: 'tab-provenance',
+          worktreeId: TEST_WORKTREE_ID,
+          title: 'CLI task',
+          activeLeafId: 'pane:1',
+          layout: null,
+          ...tab
+        }
+      ],
+      leaves: [
+        {
+          tabId: 'tab-provenance',
+          worktreeId: TEST_WORKTREE_ID,
+          leafId: 'pane:1',
+          paneRuntimeId: 1,
+          ptyId: 'pty-provenance'
+        }
+      ]
+    })
+
+    runtime.attachWindow(1)
+    runtime.syncWindowGraph(1, graph({ creationOrigin: 'cli', hasEverReceivedExternalInput: true }))
+    runtime.syncWindowGraph(1, graph({}))
+
+    const internals = runtime as unknown as {
+      tabs: Map<string, { creationOrigin?: string; hasEverReceivedExternalInput?: boolean }>
+      ptysById: Map<
+        string,
+        { creationOrigin: string | null; hasEverReceivedExternalInput: boolean }
+      >
+    }
+    expect(internals.tabs.get('tab-provenance')).toMatchObject({
+      creationOrigin: 'cli',
+      hasEverReceivedExternalInput: true
+    })
+    expect(internals.ptysById.get('pty-provenance')).toMatchObject({
+      creationOrigin: 'cli',
+      hasEverReceivedExternalInput: true
+    })
+  })
+
   it('projects runtime-backed settings to paired clients', () => {
     const terminalQuickCommands = [
       {
@@ -10957,6 +11026,8 @@ describe('OrcaRuntimeService', () => {
     expect(revealTerminalSession).toHaveBeenCalledWith(TEST_WORKTREE_ID, {
       ptyId: 'pty-bg',
       title: 'worker',
+      creationOrigin: 'user',
+      hasEverReceivedExternalInput: true,
       launchConfig: {
         agentArgs: '--model gpt-5',
         agentEnv: { CODEX_PROFILE: 'captured' }
@@ -11712,6 +11783,8 @@ describe('OrcaRuntimeService', () => {
     expect(revealTerminalSession).toHaveBeenCalledWith(TEST_WORKTREE_ID, {
       ptyId: 'pty-bg',
       title: null,
+      creationOrigin: 'user',
+      hasEverReceivedExternalInput: true,
       launchConfig: {
         agentCommand: 'claude --teammate-mode in-process',
         agentArgs: '',
@@ -12312,6 +12385,7 @@ describe('OrcaRuntimeService', () => {
       expect(revealTerminalSession).toHaveBeenCalledWith(TEST_WORKTREE_ID, {
         ptyId: 'pty-bg',
         title: null,
+        creationOrigin: 'user',
         activate: false,
         tabId: spawnedEnv.ORCA_TAB_ID,
         leafId: spawnedLeafId
@@ -32408,6 +32482,8 @@ describe('OrcaRuntimeService', () => {
     expect(revealTerminalSession).toHaveBeenLastCalledWith(result.worktree.id, {
       ptyId: 'pty-setup',
       title: 'Setup',
+      creationOrigin: 'user',
+      hasEverReceivedExternalInput: true,
       activate: false,
       tabId: setupSpawnEnv.ORCA_TAB_ID,
       leafId: setupLeafId
@@ -32634,6 +32710,7 @@ describe('OrcaRuntimeService', () => {
     expect(revealTerminalSession).toHaveBeenCalledWith(result.worktree.id, {
       ptyId: 'pty-created-worktree',
       title: null,
+      creationOrigin: 'user',
       activate: false,
       tabId: initialSpawnEnv.ORCA_TAB_ID,
       leafId: initialLeafId

@@ -3149,6 +3149,7 @@ describe('OrcaRuntimeRpcServer', () => {
       params: {
         worktree: 'id:repo-1::/tmp/worktree-a',
         command: "claude 'work on the issue'",
+        creationOrigin: 'cli',
         terminalColorQueryReplies: { foreground: '#ffffff', background: '#282c34' },
         tabId: 'laptop-tab',
         leafId,
@@ -3174,6 +3175,16 @@ describe('OrcaRuntimeRpcServer', () => {
         terminalColorQueryReplies: { foreground: '#ffffff', background: '#282c34' }
       })
     )
+    const runtimeInternals = runtime as unknown as {
+      ptysById: Map<
+        string,
+        { creationOrigin: string | null; hasEverReceivedExternalInput: boolean }
+      >
+    }
+    expect(runtimeInternals.ptysById.get('laptop-created-pty')).toMatchObject({
+      creationOrigin: 'cli',
+      hasEverReceivedExternalInput: true
+    })
     runtime.onPtyData('laptop-created-pty', '\x1b]0;Claude working\x07', 456)
     runtime.onPtyData('laptop-created-pty', 'Claude is working...\r\n', 456)
 

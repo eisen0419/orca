@@ -54,7 +54,9 @@ function makeAutomationTab(): TerminalTab {
     customTitle: null,
     color: null,
     sortOrder: 0,
-    createdAt: 1
+    createdAt: 1,
+    creationOrigin: 'cli',
+    hasEverReceivedExternalInput: true
   }
 }
 
@@ -116,7 +118,15 @@ describe('syncRuntimeGraph background automation tabs', () => {
     expect(graph.leaves).toContainEqual(
       expect.objectContaining({ tabId: 'auto-tab-1', leafId: LEAF, ptyId: AUTO_PTY })
     )
-    expect(graph.tabs).toContainEqual(expect.objectContaining({ tabId: 'auto-tab-1' }))
+    expect(graph.tabs).toContainEqual({
+      tabId: 'auto-tab-1',
+      worktreeId: 'wt-1',
+      title: 'Generate PO review prep brief',
+      activeLeafId: LEAF,
+      layout: { type: 'leaf', leafId: LEAF },
+      creationOrigin: 'cli',
+      hasEverReceivedExternalInput: true
+    })
     // Why: the no-live-transport anomaly must stay scoped to mounted tabs; an
     // unmounted background tab legitimately has no live transport yet.
     expect(warnTerminalLifecycleAnomaly).not.toHaveBeenCalled()

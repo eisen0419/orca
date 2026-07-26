@@ -18,7 +18,7 @@ function createMockRuntime(): CoordinatorRuntime & {
   sentMessages: { handle: string; text: string }[]
   terminals: { handle: string; worktreeId: string; connected: boolean; writable: boolean }[]
   createdTerminals: string[]
-  createdTerminalOptions: { title?: string }[]
+  createdTerminalOptions: { title?: string; creationOrigin?: 'orchestration' }[]
   probeDriftCalls: string[]
   probeDriftResult: DriftResult
   cliCommand: 'orca' | 'orca-ide'
@@ -49,7 +49,10 @@ function createMockRuntime(): CoordinatorRuntime & {
     async listTerminals() {
       return { terminals: mock.terminals }
     },
-    async createTerminal(_worktree?: string, opts?: { title?: string }) {
+    async createTerminal(
+      _worktree?: string,
+      opts?: { title?: string; creationOrigin?: 'orchestration' }
+    ) {
       const handle = `term_worker_${mock.createdTerminals.length}`
       mock.createdTerminals.push(handle)
       mock.createdTerminalOptions.push(opts ?? {})
@@ -288,6 +291,9 @@ describe('Coordinator', () => {
 
     expect(runtime.createdTerminals.length).toBe(1)
     expect(runtime.createdTerminalOptions[0]).not.toHaveProperty('presentation')
+    expect(runtime.createdTerminalOptions[0]).toMatchObject({
+      creationOrigin: 'orchestration'
+    })
 
     // Complete the task
     insertWorkerDone(db, { taskId: task.id, from: runtime.createdTerminals[0] })

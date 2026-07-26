@@ -92,6 +92,7 @@ const mockApi = {
 globalThis.window = { api: mockApi }
 
 import type { WorkspaceSessionState } from '../../../../shared/types'
+import { isTerminalIdleEmptyReclaimEligible } from '../../../../shared/terminal-idle-reclaim'
 import {
   FLOATING_TERMINAL_WORKTREE_ID,
   getDefaultWorkspaceSession
@@ -145,6 +146,32 @@ describe('hydrateWorkspaceSession', () => {
       ptyIdsByLeafId: { 'pane:1': 'daemon-session-1' },
       buffersByLeafId: { 'pane:1': 'buffer' }
     })
+  })
+
+  it('keeps legacy terminals without provenance or input facts exempt from idle reclaim', () => {
+    const store = createTestStore()
+    const worktreeId = 'repo1::/wt-1'
+    seedStore(store, {
+      worktreesByRepo: {
+        repo1: [makeWorktree({ id: worktreeId, repoId: 'repo1', path: '/wt-1' })]
+      }
+    })
+    const session: WorkspaceSessionState = {
+      ...getDefaultWorkspaceSession(),
+      activeRepoId: 'repo1',
+      activeWorktreeId: worktreeId,
+      activeTabId: 'legacy-tab',
+      tabsByWorktree: {
+        [worktreeId]: [makeTab({ id: 'legacy-tab', worktreeId, ptyId: 'legacy-pty' })]
+      }
+    }
+
+    store.getState().hydrateWorkspaceSession(session)
+
+    const tab = store.getState().tabsByWorktree[worktreeId]?.[0]
+    expect(tab?.creationOrigin).toBeUndefined()
+    expect(tab?.hasEverReceivedExternalInput).toBeUndefined()
+    expect(isTerminalIdleEmptyReclaimEligible(tab ?? {})).toBe(false)
   })
 
   it('hydrates runtime-owned tabs from host partitions before remote catalogs load', () => {

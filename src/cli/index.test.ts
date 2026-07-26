@@ -3037,6 +3037,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: undefined,
       title: 'RUNNER',
       focus: true,
@@ -3110,6 +3111,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'codex',
       title: 'Codex',
       focus: false,
@@ -3149,6 +3151,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'codex',
       title: 'Codex',
       focus: true,
@@ -3188,6 +3191,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'codex exec summarize',
       title: 'Codex exec',
       focus: false
@@ -3224,6 +3228,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'codex -m gpt-5 --sandbox workspace-write exec summarize',
       title: 'Codex exec',
       focus: false
@@ -3260,6 +3265,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'codex --model=gpt-5 --sandbox=workspace-write review',
       title: 'Codex review',
       focus: false
@@ -3296,6 +3302,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'codex --help',
       title: 'Codex help',
       focus: false
@@ -3332,6 +3339,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'codex -m gpt-5 "fix the flaky test"',
       title: 'Codex prompt',
       focus: false,
@@ -3370,6 +3378,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'claude',
       title: 'Claude',
       focus: false,
@@ -3408,6 +3417,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'path:/tmp/repo/feature',
+      creationOrigin: 'cli',
       command: 'claude -p "summarize"',
       title: 'Claude print',
       focus: false
@@ -3669,6 +3679,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'id:repo-1::/srv/orca/feature',
+      creationOrigin: 'cli',
       command: undefined,
       title: undefined,
       focus: false
@@ -3804,6 +3815,7 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
       worktree: 'id:repo-1::/srv/orca/feature',
+      creationOrigin: 'cli',
       command: 'codex',
       title: 'Codex',
       focus: false

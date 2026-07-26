@@ -13025,7 +13025,19 @@ describe('registerPtyHandlers', () => {
   it('acknowledges pty writes only for owned PTYs', async () => {
     const mockProc = createMockProc()
     spawnMock.mockReturnValue(mockProc.proc)
-    registerPtyHandlers(mainWindow as never)
+    const recordExternalTerminalInput = vi.fn()
+    registerPtyHandlers(
+      mainWindow as never,
+      {
+        setPtyController: vi.fn(),
+        preAllocateHandleForPty: vi.fn(),
+        onPtySpawned: vi.fn(),
+        onPtyData: vi.fn(),
+        onPtyExit: vi.fn(),
+        getDriver: vi.fn(() => ({ kind: 'desktop' })),
+        recordExternalTerminalInput
+      } as never
+    )
     const result = (await handlers.get('pty:spawn')!(null, {
       cols: 80,
       rows: 24
@@ -13038,6 +13050,7 @@ describe('registerPtyHandlers', () => {
       })
     ).toBe(true)
     expect(mockProc.proc.write).toHaveBeenCalledWith('\x03')
+    expect(recordExternalTerminalInput).toHaveBeenCalledWith(result.id, 'external')
     expect(
       handlers.get('pty:writeAccepted')!(mainWindowIpcEvent, {
         id: 'missing-pty-for-write-ack',
@@ -13045,6 +13058,7 @@ describe('registerPtyHandlers', () => {
       })
     ).toBe(false)
     expect(mockProc.proc.write).toHaveBeenCalledTimes(1)
+    expect(recordExternalTerminalInput).toHaveBeenCalledTimes(1)
   })
 
   it('rejects malformed and cross-window pty write IPC before provider writes', async () => {

@@ -180,8 +180,10 @@ describe('agent session RPC methods', () => {
     )
     expect(createTerminal).toHaveBeenCalledWith('id:worktree-1', {
       command: 'codex resume provider-session-1',
+      creationOrigin: 'user',
       startupCommandDelivery: undefined,
       env: undefined,
+      envToDelete: undefined,
       launchAgent: 'codex',
       title: undefined,
       focus: false,
