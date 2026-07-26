@@ -536,7 +536,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
     runtime.dispose()
   })
 
-  it('leaves orchestration facts null when lazy DB initialization cannot be established', async () => {
+  it('leaves orchestration facts null without constructing an unopened DB', async () => {
     const runtime = new OrcaRuntimeService(makeStore(true) as never)
     const internals = runtime as unknown as RuntimeIdleReclaimInternals
     internals.graphStatus = 'ready'
@@ -547,7 +547,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
       getForegroundProcess: vi.fn(async () => 'zsh'),
       inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
     })
-    vi.spyOn(runtime, 'getOrchestrationDb').mockImplementation(() => {
+    const getOrchestrationDb = vi.spyOn(runtime, 'getOrchestrationDb').mockImplementation(() => {
       throw new Error('db unavailable')
     })
     const pty = internals.recordPtyWorktree('pty-db', WORKTREE_ID, {
@@ -566,6 +566,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
       isActiveCoordinatorHandle: null,
       hasPendingOrDispatchedContext: null
     })
+    expect(getOrchestrationDb).not.toHaveBeenCalled()
     runtime.dispose()
   })
 

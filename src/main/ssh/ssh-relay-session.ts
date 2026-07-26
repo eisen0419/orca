@@ -1384,7 +1384,8 @@ export class SshRelaySession {
             }
           } else {
             this.runtime?.onPtySpawned(appPtyId, attachResult.incarnationId, {
-              awaitsRegistration: false
+              awaitsRegistration: false,
+              launchFactsAuthoritative: false
             })
           }
         }

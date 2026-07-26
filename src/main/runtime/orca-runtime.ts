@@ -24,6 +24,7 @@ import {
 } from './idle-empty-terminal-reclaim-collector'
 import {
   evaluateIdleReclaimCandidate,
+  type IdleEmptyTerminalReclaimCandidate,
   type IdleEmptyTerminalReclaimInspection,
   type IdleEmptyTerminalReclaimRefusalReason
 } from './idle-empty-terminal-reclaim'
@@ -1206,6 +1207,128 @@ type RuntimePtyWorktreeRecord = {
   activityGeneration: number
   // Why: memoized wait scan of the current retained tail (see RuntimeLeafRecord).
   tailWaitState?: TerminalTailWaitState
+}
+
+type IdleEmptyTerminalReclaimPersistedBinding = {
+  tabId: string
+  leafId: string | null
+  ptyId: string
+  worktreeId: string
+  source: 'layout' | 'tab' | 'remote-session'
+}
+
+type IdleEmptyTerminalReclaimPersistedBindingIndex = {
+  bindingsByPtyId: ReadonlyMap<string, readonly IdleEmptyTerminalReclaimPersistedBinding[]>
+  ambiguousPtyIds: ReadonlySet<string>
+}
+
+type IdleEmptyTerminalReclaimOrchestrationSnapshot = {
+  activeCoordinatorHandle: string | null
+  activeDispatchHandles: ReadonlySet<string>
+  activeDispatchPaneKeys: ReadonlySet<string>
+  activeDispatchLeafIds: ReadonlySet<string>
+}
+
+type IdleEmptyTerminalReclaimTickSnapshot = {
+  sessionByWorktreeId: ReadonlyMap<string, WorkspaceSessionState | null>
+  persistedBindingsBySession: ReadonlyMap<
+    WorkspaceSessionState,
+    IdleEmptyTerminalReclaimPersistedBindingIndex
+  >
+  rendererTabById: ReadonlyMap<string, RuntimeSyncedTab>
+  rendererLeafByKey: ReadonlyMap<string, RuntimeLeafRecord>
+  rendererLeafCountByTabId: ReadonlyMap<string, number>
+  rendererPtyReferenceCount: ReadonlyMap<string, number>
+  hookAgentStatusByPaneKey: ReadonlyMap<
+    string,
+    IdleEmptyTerminalReclaimCandidate['agentStatus']
+  > | null
+  handlesByPtyId: ReadonlyMap<string, ReadonlySet<string>>
+  handlesByLeafId: ReadonlyMap<string, ReadonlySet<string>>
+  handlesByPaneKey: ReadonlyMap<string, ReadonlySet<string>>
+  archiveInFlightTabIds: ReadonlySet<string>
+  sleepingPtyIds: ReadonlySet<string>
+  orchestration: IdleEmptyTerminalReclaimOrchestrationSnapshot | null
+}
+
+const IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK = 64
+const IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS = 200
+
+function indexIdleEmptyTerminalReclaimPersistedBindings(
+  session: WorkspaceSessionState
+): IdleEmptyTerminalReclaimPersistedBindingIndex {
+  const worktreeIdByTabId = new Map<string, string | null>()
+  for (const [worktreeId, tabs] of Object.entries(session.tabsByWorktree)) {
+    for (const tab of tabs) {
+      const existingWorktreeId = worktreeIdByTabId.get(tab.id)
+      worktreeIdByTabId.set(
+        tab.id,
+        existingWorktreeId && existingWorktreeId !== worktreeId ? null : worktreeId
+      )
+    }
+  }
+
+  const bindingsByPtyId = new Map<string, IdleEmptyTerminalReclaimPersistedBinding[]>()
+  const ambiguousPtyIds = new Set<string>()
+  const addBinding = (binding: IdleEmptyTerminalReclaimPersistedBinding): void => {
+    if (ambiguousPtyIds.has(binding.ptyId)) {
+      return
+    }
+    const bindings = bindingsByPtyId.get(binding.ptyId) ?? []
+    bindings.push(binding)
+    bindingsByPtyId.set(binding.ptyId, bindings)
+  }
+  const markAmbiguous = (ptyId: string | null | undefined): void => {
+    if (!ptyId) {
+      return
+    }
+    bindingsByPtyId.delete(ptyId)
+    ambiguousPtyIds.add(ptyId)
+  }
+
+  for (const [tabId, layout] of Object.entries(session.terminalLayoutsByTabId)) {
+    if (worktreeIdByTabId.get(tabId)) {
+      continue
+    }
+    for (const ptyId of Object.values(layout.ptyIdsByLeafId ?? {})) {
+      markAmbiguous(ptyId)
+    }
+  }
+
+  for (const [worktreeId, tabs] of Object.entries(session.tabsByWorktree)) {
+    for (const tab of tabs) {
+      const tabWorktreeId = worktreeIdByTabId.get(tab.id)
+      const layout = session.terminalLayoutsByTabId[tab.id]
+      if (tabWorktreeId !== worktreeId) {
+        for (const ptyId of Object.values(layout?.ptyIdsByLeafId ?? {})) {
+          markAmbiguous(ptyId)
+        }
+        markAmbiguous(tab.ptyId)
+        markAmbiguous(session.remoteSessionIdsByTabId?.[tab.id])
+        continue
+      }
+      for (const [leafId, ptyId] of Object.entries(layout?.ptyIdsByLeafId ?? {})) {
+        if (ptyId) {
+          addBinding({ tabId: tab.id, leafId, ptyId, worktreeId, source: 'layout' })
+        }
+      }
+      if (tab.ptyId && !layout) {
+        addBinding({ tabId: tab.id, leafId: null, ptyId: tab.ptyId, worktreeId, source: 'tab' })
+      }
+      const remoteSessionPtyId = session.remoteSessionIdsByTabId?.[tab.id]
+      if (remoteSessionPtyId) {
+        addBinding({
+          tabId: tab.id,
+          leafId: null,
+          ptyId: remoteSessionPtyId,
+          worktreeId,
+          source: 'remote-session'
+        })
+      }
+    }
+  }
+
+  return { bindingsByPtyId, ambiguousPtyIds }
 }
 
 type TerminalCreateOptions = {
@@ -2664,6 +2787,10 @@ export class OrcaRuntimeService {
   // when known (banner detection covers user-typed launches), mirroring the
   // renderer detector's startupCommand seed.
   private terminalSpawnCommandsByPtyId = new Map<string, string>()
+  // Why: launch maps only prove absence for PTYs this runtime saw spawn; restored
+  // records can have the same empty maps after a process restart.
+  private launchFactsAuthoritativePtyIds = new Set<string>()
+  private idleEmptyTerminalReclaimTruncatedCandidateCount = 0
   // Why: ordinary OSC 0/1/2 titles can split across PTY chunks, especially over
   // SSH/relay buffering. Keep a small raw scan tail and feed reconstructed
   // chunks into the title tracker instead of falling back to last-title scans.
@@ -3052,6 +3179,7 @@ export class OrcaRuntimeService {
     }
     console.debug('[idle-empty-terminal-reclaim] tick decisions', {
       candidateCount: candidates.length,
+      truncatedCandidateCount: this.idleEmptyTerminalReclaimTruncatedCandidateCount,
       refusalCounts: Object.fromEntries(refusalCounts),
       eligibleCount: [...eligibleCloseModes.values()].reduce((total, count) => total + count, 0),
       eligibleCloseModes: Object.fromEntries(eligibleCloseModes)
@@ -3059,9 +3187,23 @@ export class OrcaRuntimeService {
   }
 
   private async collectIdleEmptyTerminalReclaimCandidates() {
-    const snapshots = [...this.ptysById.values()].map((pty) =>
-      this.collectIdleEmptyTerminalReclaimCandidateSnapshot(pty)
-    )
+    const tickStartedAt = Date.now()
+    const ptys = [...this.ptysById.values()]
+    const tick = this.collectIdleEmptyTerminalReclaimTickSnapshot(ptys)
+    const snapshots: IdleEmptyTerminalReclaimCandidateSnapshot[] = []
+    for (const [index, pty] of ptys.entries()) {
+      if (
+        snapshots.length >= IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK ||
+        Date.now() - tickStartedAt >= IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
+      ) {
+        this.idleEmptyTerminalReclaimTruncatedCandidateCount = ptys.length - index
+        break
+      }
+      snapshots.push(this.collectIdleEmptyTerminalReclaimCandidateSnapshot(pty, tick))
+    }
+    if (snapshots.length === ptys.length) {
+      this.idleEmptyTerminalReclaimTruncatedCandidateCount = 0
+    }
     const candidates = await collectIdleEmptyTerminalReclaimCandidates(
       snapshots,
       async (ptyId) => await this.inspectIdleEmptyTerminalReclaimPty(ptyId)
@@ -3087,14 +3229,180 @@ export class OrcaRuntimeService {
     return candidates
   }
 
+  private collectIdleEmptyTerminalReclaimTickSnapshot(
+    ptys: readonly RuntimePtyWorktreeRecord[]
+  ): IdleEmptyTerminalReclaimTickSnapshot {
+    const sessionByWorktreeId = new Map<string, WorkspaceSessionState | null>()
+    const persistedBindingsBySession = new Map<
+      WorkspaceSessionState,
+      IdleEmptyTerminalReclaimPersistedBindingIndex
+    >()
+    for (const pty of ptys) {
+      if (sessionByWorktreeId.has(pty.worktreeId)) {
+        continue
+      }
+      const session = this.getWorkspaceSessionForWorktree(pty.worktreeId)
+      sessionByWorktreeId.set(pty.worktreeId, session)
+      if (session && !persistedBindingsBySession.has(session)) {
+        persistedBindingsBySession.set(
+          session,
+          indexIdleEmptyTerminalReclaimPersistedBindings(session)
+        )
+      }
+    }
+
+    const rendererGraphAvailable = this.graphStatus === 'ready'
+    const rendererTabById = rendererGraphAvailable
+      ? new Map(this.tabs)
+      : new Map<string, RuntimeSyncedTab>()
+    const rendererLeafByKey = rendererGraphAvailable
+      ? new Map(this.leaves)
+      : new Map<string, RuntimeLeafRecord>()
+    const rendererLeafCountByTabId = new Map<string, number>()
+    const rendererPtyReferenceCount = new Map<string, number>()
+    if (rendererGraphAvailable) {
+      for (const [tabId, tab] of rendererTabById) {
+        if (tab.layout) {
+          rendererLeafCountByTabId.set(tabId, countTerminalPaneLayoutLeaves(tab.layout))
+        }
+      }
+      for (const leaf of rendererLeafByKey.values()) {
+        if (leaf.ptyId) {
+          rendererPtyReferenceCount.set(
+            leaf.ptyId,
+            (rendererPtyReferenceCount.get(leaf.ptyId) ?? 0) + 1
+          )
+        }
+      }
+    }
+
+    let hookAgentStatusByPaneKey: Map<
+      string,
+      IdleEmptyTerminalReclaimCandidate['agentStatus']
+    > | null = null
+    if (this.getAgentStatusSnapshotFn) {
+      try {
+        hookAgentStatusByPaneKey = new Map()
+        const ambiguousPaneKeys = new Set<string>()
+        for (const entry of this.getAgentStatusSnapshotFn()) {
+          if (ambiguousPaneKeys.has(entry.paneKey)) {
+            continue
+          }
+          if (hookAgentStatusByPaneKey.has(entry.paneKey)) {
+            hookAgentStatusByPaneKey.delete(entry.paneKey)
+            ambiguousPaneKeys.add(entry.paneKey)
+            continue
+          }
+          hookAgentStatusByPaneKey.set(entry.paneKey, entry.state)
+        }
+      } catch {
+        hookAgentStatusByPaneKey = null
+      }
+    }
+
+    const handlesByPtyId = new Map<string, Set<string>>()
+    const handlesByLeafId = new Map<string, Set<string>>()
+    const handlesByPaneKey = new Map<string, Set<string>>()
+    const addHandle = (
+      index: Map<string, Set<string>>,
+      key: string | null,
+      handle: string
+    ): void => {
+      if (!key) {
+        return
+      }
+      const handles = index.get(key) ?? new Set<string>()
+      handles.add(handle)
+      index.set(key, handles)
+    }
+    for (const [ptyId, handle] of this.handleByPtyId) {
+      addHandle(handlesByPtyId, ptyId, handle)
+    }
+    for (const [paneKey, handle] of this.handleByLeafKey) {
+      addHandle(handlesByPaneKey, paneKey, handle)
+      addHandle(handlesByLeafId, parsePaneKey(paneKey)?.leafId ?? null, handle)
+    }
+    for (const [handle, record] of this.handles) {
+      addHandle(handlesByPtyId, record.ptyId, handle)
+      addHandle(handlesByLeafId, record.leafId, handle)
+    }
+
+    const archiveInFlightTabIds = new Set<string>()
+    for (const operationId of this.headlessTerminalArchiveByOperationId.keys()) {
+      const tabId = /^user-close:([^:]+):/.exec(operationId)?.[1]
+      if (tabId) {
+        archiveInFlightTabIds.add(tabId)
+      }
+    }
+    const sleepingPtyIds = new Set<string>()
+    for (const state of this.terminalSleepStateByWorktreeId.values()) {
+      for (const ptyId of state.ptyIds) {
+        sleepingPtyIds.add(ptyId)
+      }
+    }
+
+    let orchestration: IdleEmptyTerminalReclaimOrchestrationSnapshot | null = null
+    const db = this._orchestrationDb
+    if (db) {
+      try {
+        const activeDispatchHandles = new Set<string>()
+        const activeDispatchPaneKeys = new Set<string>()
+        const activeDispatchLeafIds = new Set<string>()
+        const activeDispatches = db.getActiveDispatchAssignees()
+        if (activeDispatches === null) {
+          throw new Error('active_dispatches_truncated')
+        }
+        for (const dispatch of activeDispatches) {
+          activeDispatchHandles.add(dispatch.assignee_handle)
+          if (dispatch.assignee_pane_key) {
+            activeDispatchPaneKeys.add(dispatch.assignee_pane_key)
+            const leafId = parsePaneKey(dispatch.assignee_pane_key)?.leafId
+            if (leafId) {
+              activeDispatchLeafIds.add(leafId)
+            }
+          }
+        }
+        orchestration = {
+          activeCoordinatorHandle: db.getActiveCoordinatorRun()?.coordinator_handle ?? null,
+          activeDispatchHandles,
+          activeDispatchPaneKeys,
+          activeDispatchLeafIds
+        }
+      } catch {
+        orchestration = null
+      }
+    }
+
+    return {
+      sessionByWorktreeId,
+      persistedBindingsBySession,
+      rendererTabById,
+      rendererLeafByKey,
+      rendererLeafCountByTabId,
+      rendererPtyReferenceCount,
+      hookAgentStatusByPaneKey,
+      handlesByPtyId,
+      handlesByLeafId,
+      handlesByPaneKey,
+      archiveInFlightTabIds,
+      sleepingPtyIds,
+      orchestration
+    }
+  }
+
   private collectIdleEmptyTerminalReclaimCandidateSnapshot(
-    pty: RuntimePtyWorktreeRecord
+    pty: RuntimePtyWorktreeRecord,
+    tick: IdleEmptyTerminalReclaimTickSnapshot
   ): IdleEmptyTerminalReclaimCandidateSnapshot {
     const pane = parsePaneKey(pty.paneKey ?? '')
     const tabId = pty.tabId ?? pane?.tabId ?? null
     const leafId = pane?.leafId ?? null
-    const session = this.getWorkspaceSessionForWorktree(pty.worktreeId)
-    const persistedBindings = session ? this.collectPersistedPtyBindings(session, pty.ptyId) : null
+    const session = tick.sessionByWorktreeId.get(pty.worktreeId) ?? null
+    const persistedBindingIndex = session ? tick.persistedBindingsBySession.get(session) : undefined
+    const persistedBindings =
+      !persistedBindingIndex || persistedBindingIndex.ambiguousPtyIds.has(pty.ptyId)
+        ? null
+        : (persistedBindingIndex.bindingsByPtyId.get(pty.ptyId) ?? [])
     const persistedTab = tabId
       ? session?.tabsByWorktree[pty.worktreeId]?.find((tab) => tab.id === tabId)
       : undefined
@@ -3122,10 +3430,11 @@ export class OrcaRuntimeService {
             : null
 
     const rendererGraphAvailable = this.graphStatus === 'ready'
-    const rendererTab = rendererGraphAvailable && tabId ? this.tabs.get(tabId) : undefined
+    const rendererTab =
+      rendererGraphAvailable && tabId ? tick.rendererTabById.get(tabId) : undefined
     const rendererLeaf =
       rendererGraphAvailable && tabId && leafId
-        ? this.leaves.get(this.getLeafKey(tabId, leafId))
+        ? tick.rendererLeafByKey.get(this.getLeafKey(tabId, leafId))
         : undefined
     const hasExactRendererBinding =
       hasExactPtyPaneBinding &&
@@ -3141,9 +3450,7 @@ export class OrcaRuntimeService {
             ? false
             : null
     const persistedLeafIds = this.collectPersistedTerminalLeafIds(persistedLayout)
-    const rendererLeafCount = rendererTab?.layout
-      ? countTerminalPaneLayoutLeaves(rendererTab.layout)
-      : null
+    const rendererLeafCount = tabId ? (tick.rendererLeafCountByTabId.get(tabId) ?? null) : null
     const isSinglePane =
       isPersisted === true && hasExactPersistedBinding
         ? persistedLeafIds.length === 1
@@ -3151,14 +3458,15 @@ export class OrcaRuntimeService {
           ? rendererLeafCount === 1
           : null
     const rendererPtyReferences = rendererGraphAvailable
-      ? [...this.leaves.values()].filter((leaf) => leaf.ptyId === pty.ptyId).length
+      ? (tick.rendererPtyReferenceCount.get(pty.ptyId) ?? 0)
       : null
     const hasSharedPty =
       persistedBindings === null || rendererPtyReferences === null
         ? null
         : persistedBindings.length > 1 || rendererPtyReferences > 1
-    const agentStatus = this.collectIdleEmptyTerminalReclaimAgentStatus(pty, pane)
-    const orchestration = this.collectIdleEmptyTerminalReclaimOrchestrationFacts(pty, pane)
+    const agentStatus = this.collectIdleEmptyTerminalReclaimAgentStatus(pty, pane, tick)
+    const orchestration = this.collectIdleEmptyTerminalReclaimOrchestrationFacts(pty, pane, tick)
+    const launchFactsAuthoritative = this.launchFactsAuthoritativePtyIds.has(pty.ptyId)
     const hasMobileSubscriber =
       (this.mobileSubscribers.get(pty.ptyId)?.size ?? 0) > 0 ||
       this.pendingSoftLeavers.has(pty.ptyId)
@@ -3192,23 +3500,35 @@ export class OrcaRuntimeService {
         isPersisted === true && pane
           ? Boolean(session?.sleepingAgentSessionsByPaneKey?.[makePaneKey(pane.tabId, pane.leafId)])
           : null,
-      hasPendingRestoreOrReconnect: this.pendingRestoreTimers.has(pty.ptyId) ? true : null,
-      hasStartupCommand: this.terminalSpawnCommandsByPtyId.has(pty.ptyId) ? true : null,
+      hasPendingRestoreOrReconnect: this.pendingRestoreTimers.has(pty.ptyId)
+        ? true
+        : launchFactsAuthoritative
+          ? false
+          : null,
+      hasStartupCommand: this.terminalSpawnCommandsByPtyId.has(pty.ptyId)
+        ? true
+        : launchFactsAuthoritative
+          ? false
+          : null,
       hasLaunchConfig:
         pty.launchConfig !== null ||
         (pane &&
           session?.sleepingAgentSessionsByPaneKey?.[makePaneKey(pane.tabId, pane.leafId)]
             ?.launchConfig !== undefined)
           ? true
-          : null,
-      hasResumeProviderSession: null,
+          : launchFactsAuthoritative
+            ? false
+            : null,
+      hasResumeProviderSession: launchFactsAuthoritative ? false : null,
       hasLaunchAgent:
         pty.launchAgent !== null ||
         (tabId
           ? session?.tabsByWorktree[pty.worktreeId]?.find((tab) => tab.id === tabId)?.launchAgent
           : undefined) !== undefined
           ? true
-          : null,
+          : launchFactsAuthoritative
+            ? false
+            : null,
       hasForegroundAgent: pty.foregroundAgent !== null ? true : null,
       agentStatus,
       hasProviderSession: null,
@@ -3222,41 +3542,16 @@ export class OrcaRuntimeService {
       hasRemoteDesktopViewer: this.hasRemoteDesktopViewers(pty.ptyId),
       isActiveCoordinatorHandle: orchestration.isActiveCoordinatorHandle,
       hasPendingOrDispatchedContext: orchestration.hasPendingOrDispatchedContext,
-      hasInFlightTransaction: this.collectIdleEmptyTerminalReclaimTransactionFact(pty, tabId),
+      hasInFlightTransaction: this.collectIdleEmptyTerminalReclaimTransactionFact(pty, tabId, tick),
       hasSecondConfirmation: null,
       hasExactIdentityClaim: null
     }
   }
 
-  private collectPersistedPtyBindings(
-    session: WorkspaceSessionState,
-    ptyId: string
-  ): { tabId: string; leafId: string; ptyId: string; worktreeId: string }[] | null {
-    const worktreeIdByTabId = new Map<string, string>()
-    for (const [worktreeId, tabs] of Object.entries(session.tabsByWorktree)) {
-      for (const tab of tabs) {
-        worktreeIdByTabId.set(tab.id, worktreeId)
-      }
-    }
-    const bindings: { tabId: string; leafId: string; ptyId: string; worktreeId: string }[] = []
-    for (const [tabId, layout] of Object.entries(session.terminalLayoutsByTabId)) {
-      const worktreeId = worktreeIdByTabId.get(tabId)
-      for (const [leafId, persistedPtyId] of Object.entries(layout.ptyIdsByLeafId ?? {})) {
-        if (persistedPtyId !== ptyId) {
-          continue
-        }
-        if (!worktreeId) {
-          return null
-        }
-        bindings.push({ tabId, leafId, ptyId: persistedPtyId, worktreeId })
-      }
-    }
-    return bindings
-  }
-
   private collectIdleEmptyTerminalReclaimAgentStatus(
     pty: RuntimePtyWorktreeRecord,
-    pane: ReturnType<typeof parsePaneKey>
+    pane: ReturnType<typeof parsePaneKey>,
+    tick: IdleEmptyTerminalReclaimTickSnapshot
   ): IdleEmptyTerminalReclaimCandidateSnapshot['agentStatus'] {
     const paneKey = pane ? makePaneKey(pane.tabId, pane.leafId) : null
     const latest = paneKey ? this.latestAgentStatusByPaneKey.get(paneKey)?.payload.state : undefined
@@ -3266,92 +3561,60 @@ export class OrcaRuntimeService {
     if (pty.lastAgentStatus !== null || pty.foregroundAgent !== null || pty.launchAgent !== null) {
       return 'working'
     }
-    if (!paneKey || !this.getAgentStatusSnapshotFn) {
+    if (!paneKey || !tick.hookAgentStatusByPaneKey) {
       return null
     }
-    try {
-      const hookStatus = this.getAgentStatusSnapshotFn().find((entry) => entry.paneKey === paneKey)
-      return hookStatus?.state ?? 'none'
-    } catch {
-      return null
-    }
+    return tick.hookAgentStatusByPaneKey.get(paneKey) ?? 'none'
   }
 
   private collectIdleEmptyTerminalReclaimOrchestrationFacts(
     pty: RuntimePtyWorktreeRecord,
-    pane: ReturnType<typeof parsePaneKey>
+    pane: ReturnType<typeof parsePaneKey>,
+    tick: IdleEmptyTerminalReclaimTickSnapshot
   ): Pick<
     IdleEmptyTerminalReclaimCandidateSnapshot,
     'hasOrchestrationOwnership' | 'isActiveCoordinatorHandle' | 'hasPendingOrDispatchedContext'
   > {
-    const handles = new Set<string>()
-    const runtimeHandle =
-      this.handleByPtyId.get(pty.ptyId) ?? this.findHandleForPtyRecord(pty.ptyId)
-    if (runtimeHandle) {
-      handles.add(runtimeHandle)
-    }
+    const handles = new Set(tick.handlesByPtyId.get(pty.ptyId) ?? [])
     if (pane) {
-      const leafHandle = this.handleByLeafKey.get(this.getLeafKey(pane.tabId, pane.leafId))
-      if (leafHandle) {
-        handles.add(leafHandle)
+      for (const handle of tick.handlesByPaneKey.get(makePaneKey(pane.tabId, pane.leafId)) ?? []) {
+        handles.add(handle)
       }
-    }
-    for (const [handle, record] of this.handles) {
-      if (record.ptyId === pty.ptyId || (pane !== null && record.leafId === pane.leafId)) {
+      for (const handle of tick.handlesByLeafId.get(pane.leafId) ?? []) {
         handles.add(handle)
       }
     }
-    if (handles.size === 0) {
+    if (handles.size === 0 || !tick.orchestration) {
       return {
         hasOrchestrationOwnership: null,
         isActiveCoordinatorHandle: null,
         hasPendingOrDispatchedContext: null
       }
     }
-    const db = this.getOrchestrationDbIfAvailable()
-    if (!db) {
-      return {
-        hasOrchestrationOwnership: null,
-        isActiveCoordinatorHandle: null,
-        hasPendingOrDispatchedContext: null
-      }
-    }
-    try {
-      const activeCoordinator = db.getActiveCoordinatorRun()?.coordinator_handle ?? null
-      let hasDispatch = false
-      let isCoordinator = false
-      for (const handle of handles) {
-        hasDispatch ||= Boolean(db.getActiveDispatchForTerminal(handle))
-        isCoordinator ||= activeCoordinator === handle
-      }
-      return {
-        hasOrchestrationOwnership: hasDispatch || isCoordinator,
-        isActiveCoordinatorHandle: isCoordinator,
-        hasPendingOrDispatchedContext: hasDispatch
-      }
-    } catch {
-      return {
-        hasOrchestrationOwnership: null,
-        isActiveCoordinatorHandle: null,
-        hasPendingOrDispatchedContext: null
-      }
+    const isCoordinator = [...handles].some(
+      (handle) => tick.orchestration?.activeCoordinatorHandle === handle
+    )
+    const hasDispatch =
+      [...handles].some((handle) => tick.orchestration?.activeDispatchHandles.has(handle)) ||
+      (pane !== null &&
+        (tick.orchestration.activeDispatchPaneKeys.has(makePaneKey(pane.tabId, pane.leafId)) ||
+          tick.orchestration.activeDispatchLeafIds.has(pane.leafId)))
+    return {
+      hasOrchestrationOwnership: hasDispatch || isCoordinator,
+      isActiveCoordinatorHandle: isCoordinator,
+      hasPendingOrDispatchedContext: hasDispatch
     }
   }
 
   private collectIdleEmptyTerminalReclaimTransactionFact(
     pty: RuntimePtyWorktreeRecord,
-    tabId: string | null
+    tabId: string | null,
+    tick: IdleEmptyTerminalReclaimTickSnapshot
   ): boolean {
-    const archiveInFlight = tabId
-      ? [...this.headlessTerminalArchiveByOperationId.keys()].some((operationId) =>
-          operationId.startsWith(`user-close:${tabId}:`)
-        )
-      : false
+    const archiveInFlight = tabId ? tick.archiveInFlightTabIds.has(tabId) : false
     const sleepingWorktree = this.terminalSleepByWorktreeId.has(pty.worktreeId)
     const mutatingWorktree = this.terminalMutationTailByWorktreeId.has(pty.worktreeId)
-    const sleepingPty = this.terminalSleepStateByWorktreeId
-      .values()
-      .some((state) => state.ptyIds.includes(pty.ptyId))
+    const sleepingPty = tick.sleepingPtyIds.has(pty.ptyId)
     return archiveInFlight || sleepingWorktree || mutatingWorktree || sleepingPty
   }
 
@@ -7778,6 +8041,7 @@ export class OrcaRuntimeService {
       this.invalidateAllHandlesForPty(ptyId)
       pty!.tabId = null
       pty!.paneKey = null
+      this.invalidateIdleEmptyTerminalReclaimActivity(ptyId)
       // Reusing an exported handle would make stale client metadata name the replacement process.
       if (priorHandle === trimmed) {
         return
@@ -7838,8 +8102,11 @@ export class OrcaRuntimeService {
   onPtySpawned(
     ptyId: string,
     incarnationId?: PtyIncarnationId,
-    options: { awaitsRegistration?: boolean } = {}
+    options: { awaitsRegistration?: boolean; launchFactsAuthoritative?: boolean } = {}
   ): void {
+    if (options.launchFactsAuthoritative !== false) {
+      this.launchFactsAuthoritativePtyIds.add(ptyId)
+    }
     if (options.awaitsRegistration !== false) {
       // Why: surface absence cannot distinguish an in-flight admission from a completed headless lifecycle.
       this.pendingPtyRegistrationIncarnations.set(ptyId, incarnationId ?? null)
@@ -7847,7 +8114,10 @@ export class OrcaRuntimeService {
     const pty = this.getOrCreatePtyWorktreeRecord(ptyId)
     if (pty) {
       if (incarnationId) {
-        pty.incarnationId = incarnationId
+        if (pty.incarnationId !== incarnationId) {
+          pty.incarnationId = incarnationId
+          this.invalidateIdleEmptyTerminalReclaimActivity(ptyId)
+        }
       }
       pty.connected = true
       pty.disconnectedAt = null
@@ -7928,7 +8198,10 @@ export class OrcaRuntimeService {
     const pty = this.ptysById.get(ptyId)
     if (pty) {
       // Why: a reconnect attach reply can prove the exit generation after stale local proof was cleared.
-      pty.incarnationId = incarnationId
+      if (pty.incarnationId !== incarnationId) {
+        pty.incarnationId = incarnationId
+        this.invalidateIdleEmptyTerminalReclaimActivity(ptyId)
+      }
     }
   }
 
@@ -11345,6 +11618,7 @@ export class OrcaRuntimeService {
     this.providerVisibleRetryAtByPtyId.delete(ptyId)
     this.agentStatusOscProcessorsByPtyId.delete(ptyId)
     this.terminalSpawnCommandsByPtyId.delete(ptyId)
+    this.launchFactsAuthoritativePtyIds.delete(ptyId)
     this.disposePtyTitleTracker(ptyId)
     this.oscTitleScanTailByPtyId.delete(ptyId)
     this.osc7ScanTailByPtyId.delete(ptyId)
@@ -13661,8 +13935,12 @@ export class OrcaRuntimeService {
       throw error
     }
     for (const { claim, pty, paneKey } of validated) {
+      const bindingChanged = pty.tabId !== claim.tabId || pty.paneKey !== paneKey
       pty.tabId = claim.tabId
       pty.paneKey = paneKey
+      if (bindingChanged) {
+        this.invalidateIdleEmptyTerminalReclaimActivity(pty.ptyId)
+      }
     }
     this.hydrateHeadlessMobileSessionTabsFromWorkspaceSession(worktree.id, {
       force: true,
@@ -22357,6 +22635,7 @@ export class OrcaRuntimeService {
           : {})
       })
       reportPtySpawnCommitted()
+      this.launchFactsAuthoritativePtyIds.add(result.id)
       if (result.agentSessionEnsure) {
         const canonicalSurface = result.agentSessionEnsure.owner.surface
         preAllocatedHandle = canonicalSurface.terminalHandle
@@ -22392,8 +22671,12 @@ export class OrcaRuntimeService {
           pty.title = null
           pty.titleUpdatedAt = null
         }
+        const bindingChanged = pty.tabId !== tabId || pty.paneKey !== paneKey
         pty.tabId = tabId
         pty.paneKey = paneKey
+        if (bindingChanged) {
+          this.invalidateIdleEmptyTerminalReclaimActivity(result.id)
+        }
         pty.launchConfig = effectiveLaunchConfig
           ? copySleepingAgentLaunchConfig(effectiveLaunchConfig)
           : null
@@ -23767,6 +24050,7 @@ export class OrcaRuntimeService {
       leafId,
       persistHostSessionBinding: true
     })
+    this.launchFactsAuthoritativePtyIds.add(result.id)
     this.registerPreAllocatedHandleForPty(result.id, preAllocatedHandle)
     if (result.wslDistro) {
       this.preparePtyExecutionContext(result.id, result.wslDistro)
@@ -23774,8 +24058,12 @@ export class OrcaRuntimeService {
     this.registerPty(result.id, workspace.id, workspace.connectionId)
     const createdPty = this.getOrCreatePtyWorktreeRecord(result.id)
     if (createdPty) {
+      const bindingChanged = createdPty.tabId !== parentTabId || createdPty.paneKey !== paneKey
       createdPty.tabId = parentTabId
       createdPty.paneKey = paneKey
+      if (bindingChanged) {
+        this.invalidateIdleEmptyTerminalReclaimActivity(result.id)
+      }
     }
 
     try {

@@ -954,6 +954,28 @@ export class OrchestrationDb {
     return this.findActiveDispatchForAssignee(handle)
   }
 
+  getActiveDispatchAssignees():
+    | {
+        assignee_handle: string
+        assignee_pane_key: string | null
+      }[]
+    | null {
+    const rows = this.readRows<{
+      assignee_handle: string
+      assignee_pane_key: string | null
+    }>(
+      `SELECT assignee_handle, assignee_pane_key FROM dispatch_contexts
+       WHERE status IN ('pending', 'dispatched')
+         AND (${retainedTextBytesSql([
+           'dispatch_contexts.assignee_handle',
+           'dispatch_contexts.assignee_pane_key'
+         ])}) <= ${ORCHESTRATION_QUERY_MAX_ROW_UTF8_BYTES}
+       ORDER BY rowid`
+    )
+    // Why: a truncated ownership scan cannot prove a terminal has no dispatch.
+    return rows.length >= ORCHESTRATION_QUERY_MAX_ROWS ? null : rows
+  }
+
   /**
    * Cheap "are there any dispatch rows at all" probe. When false, no terminal
    * can have an active or recent-completed dispatch, so orchestration-context
