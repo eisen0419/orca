@@ -1243,7 +1243,7 @@ type IdleEmptyTerminalReclaimTickSnapshot = {
     string,
     IdleEmptyTerminalReclaimCandidate['agentStatus']
   > | null
-  hookProviderSessionByPaneKey: ReadonlyMap<string, boolean> | null
+  hookProviderSessionByPaneKey: ReadonlyMap<string, boolean | null> | null
   handlesByPtyId: ReadonlyMap<string, ReadonlySet<string>> | null
   handlesByLeafId: ReadonlyMap<string, ReadonlySet<string>> | null
   handlesByPaneKey: ReadonlyMap<string, ReadonlySet<string>> | null
@@ -3737,7 +3737,7 @@ export class OrcaRuntimeService {
       string,
       IdleEmptyTerminalReclaimCandidate['agentStatus']
     > | null = null
-    let hookProviderSessionByPaneKey: Map<string, boolean> | null = null
+    let hookProviderSessionByPaneKey: Map<string, boolean | null> | null = null
     if (this.getAgentStatusSnapshotFn && hasTimeRemaining()) {
       try {
         hookAgentStatusByPaneKey = new Map()
@@ -3754,7 +3754,7 @@ export class OrcaRuntimeService {
           }
           if (hookAgentStatusByPaneKey.has(entry.paneKey)) {
             hookAgentStatusByPaneKey.delete(entry.paneKey)
-            hookProviderSessionByPaneKey.delete(entry.paneKey)
+            hookProviderSessionByPaneKey.set(entry.paneKey, null)
             ambiguousPaneKeys.add(entry.paneKey)
             continue
           }
@@ -3962,15 +3962,19 @@ export class OrcaRuntimeService {
     const rendererVisibility =
       !rendererGraphAvailable || isPersisted === null
         ? null
-        : rendererTab?.worktreeId === pty.worktreeId
-          ? (rendererTab.rendererVisibility ?? null)
+        : rendererTab
+          ? rendererTab.worktreeId === pty.worktreeId
+            ? (rendererTab.rendererVisibility ?? null)
+            : null
           : rendererLeaf === undefined
             ? 'hidden'
             : null
     const hasProviderSession =
       !pane || !tick.hookProviderSessionByPaneKey
         ? null
-        : (tick.hookProviderSessionByPaneKey.get(makePaneKey(pane.tabId, pane.leafId)) ?? false)
+        : tick.hookProviderSessionByPaneKey.has(makePaneKey(pane.tabId, pane.leafId))
+          ? (tick.hookProviderSessionByPaneKey.get(makePaneKey(pane.tabId, pane.leafId)) ?? null)
+          : false
 
     return {
       tabId,

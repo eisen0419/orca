@@ -242,6 +242,14 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
       hasProviderSession: true,
       rendererVisibility: 'visible'
     })
+    withAuthorities.internals.tabs.set(HOT_TAB_ID, {
+      tabId: HOT_TAB_ID,
+      worktreeId: 'wrong-worktree',
+      rendererVisibility: 'visible'
+    })
+    const [mismatchedRenderer] =
+      await withAuthorities.internals.collectIdleEmptyTerminalReclaimCandidates()
+    expect(mismatchedRenderer?.rendererVisibility).toBeNull()
     withAuthorities.internals.graphStatus = 'unavailable'
     const [unreadableRenderer] =
       await withAuthorities.internals.collectIdleEmptyTerminalReclaimCandidates()
@@ -257,6 +265,35 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
       await withoutProviderAuthority.internals.collectIdleEmptyTerminalReclaimCandidates()
     expect(unreadableProvider?.hasProviderSession).toBeNull()
     withoutProviderAuthority.runtime.dispose()
+
+    const duplicateProviderAuthority = createHotOnlyRuntime({
+      stopAndWait: vi.fn(async () => true),
+      hasPty: () => true,
+      getAgentStatusSnapshot: () => [
+        {
+          paneKey: HOT_PANE_KEY,
+          state: 'done',
+          prompt: '',
+          connectionId: null,
+          receivedAt: 1,
+          stateStartedAt: 1,
+          providerSession: { key: 'session_id', id: 'provider-session-1' }
+        },
+        {
+          paneKey: HOT_PANE_KEY,
+          state: 'done',
+          prompt: '',
+          connectionId: null,
+          receivedAt: 2,
+          stateStartedAt: 2,
+          providerSession: { key: 'session_id', id: 'provider-session-2' }
+        }
+      ]
+    })
+    const [ambiguousProvider] =
+      await duplicateProviderAuthority.internals.collectIdleEmptyTerminalReclaimCandidates()
+    expect(ambiguousProvider?.hasProviderSession).toBeNull()
+    duplicateProviderAuthority.runtime.dispose()
   })
 
   it('retires the #10747 hot-only background shell without a persisted row or replacement PTY', async () => {
