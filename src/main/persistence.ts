@@ -6538,7 +6538,8 @@ export class Store {
       this.flushOrThrow()
       this.terminalExternalInputPersistenceDirty = false
     } catch {
-      // Why: provider-accepted terminal input is irreversible; retain the hot fact and retry its durability on a later input.
+      // Why: provider-accepted terminal input is irreversible; retain the hot fact and retry through Store's bounded save cadence.
+      this.scheduleSave()
     }
   }
 

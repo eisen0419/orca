@@ -4947,7 +4947,7 @@ describe('Store', () => {
     })
   })
 
-  it('keeps accepted terminal input hot and gates a dirty persistence retry behind the save cadence', async () => {
+  it('keeps accepted terminal input hot and schedules its first failed persistence retry on the save cadence', async () => {
     const store = await createStore()
     vi.useFakeTimers()
     try {
@@ -4973,12 +4973,12 @@ describe('Store', () => {
         hasEverReceivedExternalInput: true
       })
 
-      store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')
       expect(flush).toHaveBeenCalledTimes(1)
       await vi.advanceTimersByTimeAsync(999)
       expect(deferredWrite).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(1)
       expect(deferredWrite).toHaveBeenCalledOnce()
+      await store.waitForPendingWrite()
       store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')
       await vi.advanceTimersByTimeAsync(5_000)
       expect(deferredWrite).toHaveBeenCalledOnce()
