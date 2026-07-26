@@ -1243,6 +1243,7 @@ type IdleEmptyTerminalReclaimTickSnapshot = {
     string,
     IdleEmptyTerminalReclaimCandidate['agentStatus']
   > | null
+  hookProviderSessionByPaneKey: ReadonlyMap<string, boolean> | null
   handlesByPtyId: ReadonlyMap<string, ReadonlySet<string>> | null
   handlesByLeafId: ReadonlyMap<string, ReadonlySet<string>> | null
   handlesByPaneKey: ReadonlyMap<string, ReadonlySet<string>> | null
@@ -2751,6 +2752,11 @@ export class OrcaRuntimeService {
   // iterates them all. Listeners are cleaned up via subscriptionCleanups.
   private notificationListeners = new Set<(event: MobileNotificationEvent) => void>()
   private ptysById = new Map<string, RuntimePtyWorktreeRecord>()
+  // Prevent overlapping transactions for the same PTY incarnation and activity generation.
+  private reclaimInFlightByPtyId = new Map<
+    string,
+    { incarnationId: string; activityGeneration: number }
+  >()
   private readonly idleEmptyTerminalReclaimScheduler = new IdleEmptyTerminalReclaimScheduler(
     () => this.tickIdleEmptyTerminalReclaim(),
     {
@@ -3197,7 +3203,17 @@ export class OrcaRuntimeService {
     const refusalCounts = new Map<IdleEmptyTerminalReclaimRefusalReason, number>()
     const eligibleCloseModes = new Map<string, number>()
     for (const candidate of candidates) {
-      const decision = evaluateIdleReclaimCandidate(candidate, config, Date.now())
+      let decision = evaluateIdleReclaimCandidate(candidate, config, Date.now())
+      if (
+        candidate.isPersisted === false &&
+        candidate.rendererOwnsPersistedTab === false &&
+        (decision.eligible || decision.reason === 'final-confirmation-or-claim-missing')
+      ) {
+        const reclaim = await this.reclaimHotOnlyIdleTerminal(candidate, config)
+        if (reclaim) {
+          decision = reclaim.decision
+        }
+      }
       if (decision.eligible) {
         eligibleCloseModes.set(
           decision.closeMode,
@@ -3281,34 +3297,322 @@ export class OrcaRuntimeService {
       IdleEmptyTerminalReclaimPersistedBindingIndex
     >()
     for (const candidate of candidates) {
-      const livePty = candidate.ptyId ? this.ptysById.get(candidate.ptyId) : undefined
-      candidate.incarnationId = livePty?.incarnationId ?? null
-      candidate.activityGeneration = livePty?.activityGeneration ?? null
-      const ownership = livePty
-        ? this.collectIdleEmptyTerminalReclaimLiveOwnershipFacts(
-            livePty,
-            ownershipDeadline,
-            sessionByWorktreeId,
-            persistedBindingsBySession
-          )
-        : { isPersisted: null, rendererOwnsPersistedTab: null }
-      candidate.isPersisted = ownership.isPersisted
-      candidate.rendererOwnsPersistedTab = ownership.rendererOwnsPersistedTab
-      candidate.providerConnected =
-        candidate.inspection?.status === 'success' &&
-        livePty?.connected === true &&
-        livePty.incarnationId === candidate.expectedIncarnationId
-          ? true
-          : null
-      candidate.hasForegroundAgent =
-        livePty?.foregroundAgent !== null && livePty?.foregroundAgent !== undefined
-          ? true
-          : candidate.inspection?.status === 'success' &&
-              candidate.inspection.foregroundProcess === 'shell'
-            ? false
-            : null
+      this.finalizeIdleEmptyTerminalReclaimCandidate(
+        candidate,
+        ownershipDeadline,
+        sessionByWorktreeId,
+        persistedBindingsBySession
+      )
     }
     return candidates
+  }
+
+  private finalizeIdleEmptyTerminalReclaimCandidate(
+    candidate: IdleEmptyTerminalReclaimCandidate,
+    ownershipDeadline: number,
+    sessionByWorktreeId: Map<string, WorkspaceSessionState | null>,
+    persistedBindingsBySession: Map<
+      WorkspaceSessionState,
+      IdleEmptyTerminalReclaimPersistedBindingIndex
+    >
+  ): void {
+    const livePty = candidate.ptyId ? this.ptysById.get(candidate.ptyId) : undefined
+    candidate.incarnationId = livePty?.incarnationId ?? null
+    candidate.activityGeneration = livePty?.activityGeneration ?? null
+    const ownership = livePty
+      ? this.collectIdleEmptyTerminalReclaimLiveOwnershipFacts(
+          livePty,
+          ownershipDeadline,
+          sessionByWorktreeId,
+          persistedBindingsBySession
+        )
+      : { isPersisted: null, rendererOwnsPersistedTab: null }
+    candidate.isPersisted = ownership.isPersisted
+    candidate.rendererOwnsPersistedTab = ownership.rendererOwnsPersistedTab
+    candidate.providerConnected =
+      candidate.inspection?.status === 'success' &&
+      livePty?.connected === true &&
+      livePty.incarnationId === candidate.expectedIncarnationId
+        ? true
+        : null
+    candidate.hasForegroundAgent =
+      livePty?.foregroundAgent !== null && livePty?.foregroundAgent !== undefined
+        ? true
+        : candidate.inspection?.status === 'success' &&
+            candidate.inspection.foregroundProcess === 'shell'
+          ? false
+          : null
+  }
+
+  private async reclaimHotOnlyIdleTerminal(
+    captured: IdleEmptyTerminalReclaimCandidate,
+    config: { enabled?: unknown; idleThresholdMs?: unknown }
+  ): Promise<{
+    decision: ReturnType<typeof evaluateIdleReclaimCandidate>
+    reclaimed: boolean
+  } | null> {
+    const ptyId = captured.ptyId
+    if (
+      !ptyId ||
+      typeof captured.expectedIncarnationId !== 'string' ||
+      typeof captured.expectedActivityGeneration !== 'number'
+    ) {
+      return null
+    }
+    const livePty = this.ptysById.get(ptyId)
+    if (
+      !livePty ||
+      livePty.incarnationId !== captured.expectedIncarnationId ||
+      livePty.activityGeneration !== captured.expectedActivityGeneration ||
+      this.reclaimInFlightByPtyId.has(ptyId)
+    ) {
+      return null
+    }
+    const claim = {
+      incarnationId: captured.expectedIncarnationId,
+      activityGeneration: captured.expectedActivityGeneration
+    }
+    this.reclaimInFlightByPtyId.set(ptyId, claim)
+    try {
+      const confirmed = await this.collectIdleEmptyTerminalReclaimConfirmation(captured)
+      if (!confirmed || !this.hasExactIdleEmptyTerminalReclaimClaim(captured, claim)) {
+        return {
+          decision: { eligible: false, reason: 'final-confirmation-or-claim-missing' },
+          reclaimed: false
+        }
+      }
+      if (confirmed.isPersisted !== false || confirmed.rendererOwnsPersistedTab !== false) {
+        return {
+          decision: { eligible: false, reason: 'topology-or-binding-invalid' },
+          reclaimed: false
+        }
+      }
+      if (!this.hasExactHotOnlyIdleTerminalOwnership(confirmed)) {
+        return {
+          decision: { eligible: false, reason: 'topology-or-binding-invalid' },
+          reclaimed: false
+        }
+      }
+      confirmed.hasSecondConfirmation = true
+      confirmed.hasExactIdentityClaim = true
+      const decision = evaluateIdleReclaimCandidate(confirmed, config, Date.now())
+      if (!decision.eligible || decision.closeMode !== 'hot-only') {
+        return { decision, reclaimed: false }
+      }
+      return {
+        decision,
+        reclaimed: await this.retireHotOnlyIdleTerminal(confirmed, claim)
+      }
+    } catch {
+      return {
+        decision: { eligible: false, reason: 'final-confirmation-or-claim-missing' },
+        reclaimed: false
+      }
+    } finally {
+      if (this.reclaimInFlightByPtyId.get(ptyId) === claim) {
+        this.reclaimInFlightByPtyId.delete(ptyId)
+      }
+    }
+  }
+
+  private async collectIdleEmptyTerminalReclaimConfirmation(
+    captured: IdleEmptyTerminalReclaimCandidate
+  ): Promise<IdleEmptyTerminalReclaimCandidate | null> {
+    const ptyId = captured.ptyId
+    if (!ptyId) {
+      return null
+    }
+    const livePty = this.ptysById.get(ptyId)
+    if (!livePty) {
+      return null
+    }
+    const deadline = Date.now() + IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
+    const tick = this.collectIdleEmptyTerminalReclaimTickSnapshot([livePty], deadline)
+    const snapshot = this.collectIdleEmptyTerminalReclaimCandidateSnapshot(livePty, tick)
+    snapshot.expectedIncarnationId = captured.expectedIncarnationId
+    snapshot.expectedActivityGeneration = captured.expectedActivityGeneration
+    const [confirmed] = await collectIdleEmptyTerminalReclaimCandidates(
+      [snapshot],
+      async (candidatePtyId) => await this.inspectIdleEmptyTerminalReclaimPty(candidatePtyId)
+    )
+    if (!confirmed) {
+      return null
+    }
+    this.finalizeIdleEmptyTerminalReclaimCandidate(
+      confirmed,
+      deadline,
+      new Map([[livePty.worktreeId, this.getWorkspaceSessionForWorktree(livePty.worktreeId)]]),
+      new Map()
+    )
+    return confirmed
+  }
+
+  private hasExactIdleEmptyTerminalReclaimClaim(
+    captured: IdleEmptyTerminalReclaimCandidate,
+    claim: { incarnationId: string; activityGeneration: number }
+  ): boolean {
+    const ptyId = captured.ptyId
+    const livePty = ptyId ? this.ptysById.get(ptyId) : undefined
+    return (
+      livePty !== undefined &&
+      ptyId !== null &&
+      this.reclaimInFlightByPtyId.get(ptyId) === claim &&
+      livePty.incarnationId === claim.incarnationId &&
+      livePty.activityGeneration === claim.activityGeneration &&
+      captured.incarnationId === claim.incarnationId &&
+      captured.activityGeneration === claim.activityGeneration &&
+      captured.expectedIncarnationId === claim.incarnationId &&
+      captured.expectedActivityGeneration === claim.activityGeneration
+    )
+  }
+
+  private async retireHotOnlyIdleTerminal(
+    candidate: IdleEmptyTerminalReclaimCandidate,
+    claim: { incarnationId: string; activityGeneration: number }
+  ): Promise<boolean> {
+    if (!this.hasExactIdleEmptyTerminalReclaimClaim(candidate, claim)) {
+      return false
+    }
+    const ptyId = candidate.ptyId
+    const tabId = candidate.tabId
+    const leafId = candidate.leafId
+    const worktreeId = candidate.worktreeId
+    if (
+      !ptyId ||
+      !tabId ||
+      !leafId ||
+      !worktreeId ||
+      !this.hasExactHotOnlyIdleTerminalOwnership(candidate)
+    ) {
+      return false
+    }
+    const controller = this.ptyController
+    if (!controller?.hasPty || controller.hasPty(ptyId) !== true) {
+      return false
+    }
+    const stopped = controller.stopAndWait
+      ? await controller.stopAndWait(ptyId)
+      : Boolean(controller.kill?.(ptyId))
+    if (!stopped || controller.hasPty(ptyId) !== false) {
+      return false
+    }
+    if (
+      !this.hasExactIdleEmptyTerminalReclaimClaim(candidate, claim) ||
+      !this.hasExactHotOnlyIdleTerminalOwnership(candidate)
+    ) {
+      return false
+    }
+    this.onPtyExit(ptyId, 0, claim.incarnationId, { skipMobileSessionRetirement: true })
+    const exitedPty = this.ptysById.get(ptyId)
+    if (!exitedPty || exitedPty.incarnationId !== claim.incarnationId || exitedPty.connected) {
+      return false
+    }
+    const snapshot = this.mobileSessionTabsByWorktree.get(worktreeId)
+    if (!snapshot) {
+      return false
+    }
+    const retired = retireTerminalSurfacesFromSnapshot({
+      snapshot,
+      ptyId,
+      exactSurfaces: [{ parentTabId: tabId, leafId }],
+      exactOnly: true
+    })
+    if (!retired) {
+      return false
+    }
+    this.mobileSessionTabsByWorktree.set(worktreeId, retired.snapshot)
+    this.notifyMobileSessionTabsChanged(worktreeId)
+    const exactLeafKey = this.getLeafKey(tabId, leafId)
+    for (const [leafKey, leaf] of this.leaves) {
+      if (leaf.ptyId !== ptyId) {
+        continue
+      }
+      if (leafKey !== exactLeafKey || leaf.tabId !== tabId || leaf.leafId !== leafId) {
+        return false
+      }
+      this.leaves.delete(leafKey)
+    }
+    this.rebuildLeafPtyIndex()
+    this.invalidateAllHandlesForPty(ptyId)
+    this.detachedPreAllocatedLeaves.delete(ptyId)
+    this.disposeHeadlessTerminal(ptyId)
+    if (this.ptysById.get(ptyId)?.incarnationId === claim.incarnationId) {
+      this.dropDisconnectedPtyRecord(ptyId)
+    }
+    return true
+  }
+
+  private hasExactHotOnlyIdleTerminalOwnership(
+    candidate: IdleEmptyTerminalReclaimCandidate
+  ): boolean {
+    const ptyId = candidate.ptyId
+    const tabId = candidate.tabId
+    const leafId = candidate.leafId
+    const worktreeId = candidate.worktreeId
+    if (!ptyId || !tabId || !leafId || !worktreeId) {
+      return false
+    }
+    const pty = this.ptysById.get(ptyId)
+    if (
+      !pty ||
+      pty.worktreeId !== worktreeId ||
+      pty.tabId !== tabId ||
+      pty.paneKey !== makePaneKey(tabId, leafId) ||
+      pty.creationOrigin !== candidate.origin
+    ) {
+      return false
+    }
+    const session = this.getWorkspaceSessionForWorktree(worktreeId)
+    if (!session) {
+      return false
+    }
+    const persistedBindings = indexIdleEmptyTerminalReclaimPersistedBindings(session, () => true)
+    if (!persistedBindings) {
+      return false
+    }
+    const ownership = this.collectIdleEmptyTerminalReclaimOwnershipFacts(
+      pty,
+      session,
+      persistedBindings,
+      this.graphStatus === 'ready',
+      this.tabs,
+      this.leaves
+    )
+    if (
+      ownership.isPersisted !== false ||
+      ownership.rendererOwnsPersistedTab !== false ||
+      ownership.hasExactPtyPaneBinding !== true
+    ) {
+      return false
+    }
+    const snapshot = this.mobileSessionTabsByWorktree.get(worktreeId)
+    const matchingSurfaces = snapshot?.tabs.filter(
+      (tab): tab is RuntimeMobileSessionTerminalTab =>
+        tab.type === 'terminal' && tab.parentTabId === tabId
+    )
+    if (!matchingSurfaces || matchingSurfaces.length !== 1) {
+      return false
+    }
+    const surface = matchingSurfaces[0]
+    const surfacePtyId = surface.parentLayout?.ptyIdsByLeafId?.[leafId] ?? surface.ptyId
+    if (surface.leafId !== leafId || surfacePtyId !== ptyId) {
+      return false
+    }
+    for (const leaf of this.getLeavesForPty(ptyId)) {
+      if (leaf.tabId !== tabId || leaf.leafId !== leafId || leaf.worktreeId !== worktreeId) {
+        return false
+      }
+    }
+    const exactLeafKey = this.getLeafKey(tabId, leafId)
+    for (const [leafKey, handle] of this.handleByLeafKey) {
+      if (this.handles.get(handle)?.ptyId === ptyId && leafKey !== exactLeafKey) {
+        return false
+      }
+    }
+    const handle = this.handleByPtyId.get(ptyId)
+    return (
+      handle === undefined || !this.handles.has(handle) || this.handles.get(handle)?.ptyId === ptyId
+    )
   }
 
   private collectIdleEmptyTerminalReclaimLiveOwnershipFacts(
@@ -3433,13 +3737,16 @@ export class OrcaRuntimeService {
       string,
       IdleEmptyTerminalReclaimCandidate['agentStatus']
     > | null = null
+    let hookProviderSessionByPaneKey: Map<string, boolean> | null = null
     if (this.getAgentStatusSnapshotFn && hasTimeRemaining()) {
       try {
         hookAgentStatusByPaneKey = new Map()
+        hookProviderSessionByPaneKey = new Map()
         const ambiguousPaneKeys = new Set<string>()
         for (const entry of this.getAgentStatusSnapshotFn()) {
           if (!hasTimeRemaining()) {
             hookAgentStatusByPaneKey = null
+            hookProviderSessionByPaneKey = null
             break
           }
           if (ambiguousPaneKeys.has(entry.paneKey)) {
@@ -3447,16 +3754,20 @@ export class OrcaRuntimeService {
           }
           if (hookAgentStatusByPaneKey.has(entry.paneKey)) {
             hookAgentStatusByPaneKey.delete(entry.paneKey)
+            hookProviderSessionByPaneKey.delete(entry.paneKey)
             ambiguousPaneKeys.add(entry.paneKey)
             continue
           }
           hookAgentStatusByPaneKey.set(entry.paneKey, entry.state)
+          hookProviderSessionByPaneKey.set(entry.paneKey, entry.providerSession !== undefined)
         }
         if (!hasTimeRemaining()) {
           hookAgentStatusByPaneKey = null
+          hookProviderSessionByPaneKey = null
         }
       } catch {
         hookAgentStatusByPaneKey = null
+        hookProviderSessionByPaneKey = null
       }
     }
 
@@ -3584,6 +3895,7 @@ export class OrcaRuntimeService {
       rendererLeafCountByTabId,
       rendererPtyReferenceCount,
       hookAgentStatusByPaneKey,
+      hookProviderSessionByPaneKey,
       handlesByPtyId,
       handlesByLeafId,
       handlesByPaneKey,
@@ -3618,6 +3930,7 @@ export class OrcaRuntimeService {
       hasExactPersistedBinding,
       isPersisted,
       rendererGraphAvailable,
+      rendererTab,
       rendererLeaf,
       hasExactRendererBinding,
       rendererOwnsPersistedTab
@@ -3646,6 +3959,18 @@ export class OrcaRuntimeService {
     const hasMobileSubscriber =
       (this.mobileSubscribers.get(pty.ptyId)?.size ?? 0) > 0 ||
       this.pendingSoftLeavers.has(pty.ptyId)
+    const rendererVisibility =
+      !rendererGraphAvailable || isPersisted === null
+        ? null
+        : rendererTab?.worktreeId === pty.worktreeId
+          ? (rendererTab.rendererVisibility ?? null)
+          : rendererLeaf === undefined
+            ? 'hidden'
+            : null
+    const hasProviderSession =
+      !pane || !tick.hookProviderSessionByPaneKey
+        ? null
+        : (tick.hookProviderSessionByPaneKey.get(makePaneKey(pane.tabId, pane.leafId)) ?? false)
 
     return {
       tabId,
@@ -3707,12 +4032,12 @@ export class OrcaRuntimeService {
             : null,
       hasForegroundAgent: pty.foregroundAgent !== null ? true : null,
       agentStatus,
-      hasProviderSession: null,
+      hasProviderSession,
       hasOrchestrationOwnership: orchestration.hasOrchestrationOwnership,
       lastActivityAt: pty.lastActivityAt,
       providerConnected: null,
       providerWritable: rendererLeaf ? rendererLeaf.writable : null,
-      rendererVisibility: null,
+      rendererVisibility,
       hasMobileDriver: this.getDriver(pty.ptyId).kind === 'mobile',
       hasMobileSubscriber,
       hasRemoteDesktopViewer: this.hasRemoteDesktopViewers(pty.ptyId),
@@ -3794,6 +4119,7 @@ export class OrcaRuntimeService {
       hasExactPersistedBinding,
       isPersisted,
       rendererGraphAvailable,
+      rendererTab,
       rendererLeaf,
       hasExactRendererBinding,
       rendererOwnsPersistedTab
@@ -11817,7 +12143,12 @@ export class OrcaRuntimeService {
     }
   }
 
-  onPtyExit(ptyId: string, exitCode: number, exitIncarnationId?: PtyIncarnationId): void {
+  onPtyExit(
+    ptyId: string,
+    exitCode: number,
+    exitIncarnationId?: PtyIncarnationId,
+    options: { skipMobileSessionRetirement?: boolean } = {}
+  ): void {
     const pty = this.ptysById.get(ptyId)
     if (exitIncarnationId && pty?.incarnationId && exitIncarnationId !== pty.incarnationId) {
       return
@@ -11953,7 +12284,7 @@ export class OrcaRuntimeService {
     if (preservesIntentionalHandlelessSurface || preservesAbnormalSshSurface) {
       // Why: relay loss is recoverable; keep the HUB-owned pane addressable through the bounded reconnect grace.
       this.touchMobileSessionSnapshotsForPty(ptyId, { immediate: true })
-    } else {
+    } else if (!options.skipMobileSessionRetirement) {
       // Why: permanent process exit is absence, not a starting/sleeping tab.
       // Retire before publishing so paired clients never persist a ghost.
       this.retireMobileSessionSurfacesForPty(ptyId, incarnationId, exactSurfaces)

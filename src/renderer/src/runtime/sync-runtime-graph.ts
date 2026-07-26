@@ -593,6 +593,7 @@ async function syncRuntimeGraph(): Promise<void> {
       title: resolveRuntimeTerminalTitle(tab, generatedTitlesEnabled),
       activeLeafId: activePaneId === null ? null : (manager?.getLeafId(activePaneId) ?? null),
       layout: serializePaneTree(root),
+      rendererVisibility: state.activeTabId === tabId ? 'visible' : 'hidden',
       ...(tab.creationOrigin ? { creationOrigin: tab.creationOrigin } : {}),
       ...(tab.hasEverReceivedExternalInput === true
         ? { hasEverReceivedExternalInput: true as const }
@@ -666,6 +667,7 @@ async function syncRuntimeGraph(): Promise<void> {
               `[sync-runtime-graph] synthesized layout for ${leafCount} unmounted leaves with no saved tree`
             )
         }),
+        rendererVisibility: state.activeTabId === tab.id ? 'visible' : 'hidden',
         ...(tab.creationOrigin ? { creationOrigin: tab.creationOrigin } : {}),
         ...(tab.hasEverReceivedExternalInput === true
           ? { hasEverReceivedExternalInput: true as const }

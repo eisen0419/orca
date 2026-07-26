@@ -449,12 +449,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
 
     const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
 
-    const deferredFields = [
-      'hasProviderSession',
-      'rendererVisibility',
-      'hasSecondConfirmation',
-      'hasExactIdentityClaim'
-    ]
+    const deferredFields = ['rendererVisibility', 'hasSecondConfirmation', 'hasExactIdentityClaim']
     expect(
       Object.entries(candidate!)
         .filter(([, value]) => value === null)
@@ -469,6 +464,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
       hasLaunchAgent: false,
       hasForegroundAgent: false,
       agentStatus: 'none',
+      hasProviderSession: false,
       hasOrchestrationOwnership: false
     })
     expect(
@@ -476,7 +472,6 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
         {
           ...candidate!,
           // A2b-2 owns these still-deferred confirmation authorities.
-          hasProviderSession: false,
           rendererVisibility: 'hidden',
           hasSecondConfirmation: true,
           hasExactIdentityClaim: true

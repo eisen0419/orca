@@ -234,12 +234,20 @@ describe('workspace terminal archive transition', () => {
     expect(schema.safeParse(value).success).toBe(false)
   })
 
-  it.each(['cleanup', 'pty-exit', 'app-shutdown', 'hibernation', 'pane-close'] as const)(
-    'does not archive %s',
-    (reason) => {
-      expect(shouldArchiveTerminalClose(reason)).toBe(false)
-    }
-  )
+  it.each([
+    'cleanup',
+    'pty-exit',
+    'app-shutdown',
+    'hibernation',
+    'pane-close',
+    'idle-empty-reclaim'
+  ] as const)('does not archive %s', (reason) => {
+    expect(shouldArchiveTerminalClose(reason)).toBe(false)
+  })
+
+  it('keeps user-close archiving enabled', () => {
+    expect(shouldArchiveTerminalClose('user-close')).toBe(true)
+  })
 
   it('does not kill a PTY still owned by another tab when retiring', () => {
     const retired = retireArchivedTerminalTab(session(), WORKTREE_ID, TAB_ID)

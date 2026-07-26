@@ -327,7 +327,8 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
           isSinglePane: true,
           isPersisted: true,
           isPinned: false,
-          isSleepingOrHibernating: false
+          isSleepingOrHibernating: false,
+          rendererVisibility: 'hidden'
         }
       }),
       expectedCollectedCandidate({
@@ -335,7 +336,8 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
         leafId: HOT_LEAF_ID,
         ptyId: 'pty-hot',
         incarnationId: 'hot-incarnation',
-        lastActivityAt: hotPty.lastActivityAt
+        lastActivityAt: hotPty.lastActivityAt,
+        overrides: { rendererVisibility: 'hidden' }
       })
     ])
     runtime.dispose()

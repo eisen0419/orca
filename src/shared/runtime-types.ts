@@ -129,6 +129,7 @@ export type RuntimeSyncedTab = {
   title: string | null
   activeLeafId: string | null
   layout: TerminalPaneLayoutNode | null
+  rendererVisibility?: 'hidden' | 'visible'
   creationOrigin?: TerminalCreationOrigin
   hasEverReceivedExternalInput?: true
 }

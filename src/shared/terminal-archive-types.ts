@@ -27,7 +27,8 @@ export const TERMINAL_ARCHIVE_CLOSE_EXCLUSIONS = [
   'pty-exit',
   'app-shutdown',
   'hibernation',
-  'pane-close'
+  'pane-close',
+  'idle-empty-reclaim'
 ] as const
 
 export type TerminalArchiveCloseExclusion = (typeof TERMINAL_ARCHIVE_CLOSE_EXCLUSIONS)[number]
