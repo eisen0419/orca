@@ -142,6 +142,7 @@ import {
   isTerminalInputTooLargeWithDeferredMeasurement,
   iterateTerminalInputChunks
 } from '../../shared/terminal-input'
+import { isTerminalQueryReply } from '../../shared/terminal-query-reply'
 import { isRemoteAgentHooksEnabled } from '../../shared/agent-hook-relay'
 import { createTerminalSessionStateSaveFailureMessage } from '../../shared/terminal-session-state-save-failure'
 import { RendererTerminalSerializerReadiness } from './renderer-terminal-serializer-readiness'
@@ -4246,6 +4247,10 @@ export function registerPtyHandlers(
               tabId: hostSessionBinding.tabId,
               leafId: hostSessionBinding.leafId,
               ptyId: result.id,
+              ...(args.creationOrigin ? { creationOrigin: args.creationOrigin } : {}),
+              ...(args.hasEverReceivedExternalInput === true
+                ? { hasEverReceivedExternalInput: true as const }
+                : {}),
               ...(result.incarnationId ? { incarnationId: result.incarnationId } : {}),
               ...(cwd ? { startupCwd: cwd } : {}),
               archiveHint: archiveHintForSpawn(
@@ -5630,34 +5635,49 @@ export function registerPtyHandlers(
   const writePtyProviderInputWithinLimit = (
     provider: IPtyProvider,
     id: string,
-    data: string
+    data: string,
+    onWriteAccepted?: () => void
   ): boolean | Promise<boolean> => {
     const chunks = iterateTerminalInputChunks(data)
     const first = chunks.next()
     if (first.done) {
       provider.write(id, data)
+      onWriteAccepted?.()
       return true
     }
     const second = chunks.next()
     if (second.done) {
       provider.write(id, first.value)
+      onWriteAccepted?.()
       return true
     }
-    return writePtyProviderInputChunks(provider, id, chunks, first.value, second.value)
+    return writePtyProviderInputChunks(
+      provider,
+      id,
+      chunks,
+      first.value,
+      second.value,
+      onWriteAccepted
+    )
   }
 
   const writePtyProviderInput = (
     provider: IPtyProvider,
     id: string,
-    data: string
+    data: string,
+    onWriteAccepted?: () => void
   ): boolean | Promise<boolean> => {
     try {
       const tooLarge = isTerminalInputTooLargeWithDeferredMeasurement(data)
       if (typeof tooLarge === 'boolean') {
-        return tooLarge ? false : writePtyProviderInputWithinLimit(provider, id, data)
+        return tooLarge
+          ? false
+          : writePtyProviderInputWithinLimit(provider, id, data, onWriteAccepted)
       }
       return tooLarge
-        .then((result) => (result ? false : writePtyProviderInputWithinLimit(provider, id, data)))
+        .then((result) =>
+          result ? false : writePtyProviderInputWithinLimit(provider, id, data, onWriteAccepted)
+        )
         .catch(() => false)
     } catch {
       return false
@@ -5669,13 +5689,15 @@ export function registerPtyHandlers(
     id: string,
     chunks: Iterator<string>,
     firstChunk: string,
-    secondChunk: string
+    secondChunk: string,
+    onWriteAccepted?: () => void
   ): Promise<boolean> => {
     try {
       let chunk: IteratorResult<string> = { done: false, value: firstChunk }
       let nextChunk: IteratorResult<string> = { done: false, value: secondChunk }
       while (!chunk.done) {
         provider.write(id, chunk.value)
+        onWriteAccepted?.()
         if (!nextChunk.done) {
           await new Promise((resolve) => setTimeout(resolve, 0))
         }
@@ -5734,19 +5756,21 @@ export function registerPtyHandlers(
       if (visibleRendererPtys.has(args.id)) {
         clearHiddenRendererResizeOutput(args.id)
       }
-      const result = writePtyProviderInput(provider, args.id, args.data)
-      if (typeof result === 'boolean') {
-        if (result) {
-          runtime?.recordExternalTerminalInput(args.id, 'external')
+      let recorded = false
+      const recordAcceptedWrite = (): void => {
+        if (!recorded) {
+          recorded = true
+          runtime?.recordExternalTerminalInput(
+            args.id,
+            isTerminalQueryReply(args.data) ? 'protocol-reply' : 'external'
+          )
         }
+      }
+      const result = writePtyProviderInput(provider, args.id, args.data, recordAcceptedWrite)
+      if (typeof result === 'boolean') {
         return result
       }
-      return result.then((accepted) => {
-        if (accepted) {
-          runtime?.recordExternalTerminalInput(args.id, 'external')
-        }
-        return accepted
-      })
+      return result
     } catch {
       return false
     }
@@ -5771,19 +5795,21 @@ export function registerPtyHandlers(
       if (visibleRendererPtys.has(args.id)) {
         clearHiddenRendererResizeOutput(args.id)
       }
-      const result = writePtyProviderInput(provider, args.id, args.data)
-      if (typeof result === 'boolean') {
-        if (result) {
-          runtime?.recordExternalTerminalInput(args.id, 'external')
+      let recorded = false
+      const recordAcceptedWrite = (): void => {
+        if (!recorded) {
+          recorded = true
+          runtime?.recordExternalTerminalInput(
+            args.id,
+            isTerminalQueryReply(args.data) ? 'protocol-reply' : 'external'
+          )
         }
+      }
+      const result = writePtyProviderInput(provider, args.id, args.data, recordAcceptedWrite)
+      if (typeof result === 'boolean') {
         return result
       }
-      return result.then((accepted) => {
-        if (accepted) {
-          runtime?.recordExternalTerminalInput(args.id, 'external')
-        }
-        return accepted
-      })
+      return result
     } catch {
       return false
     }

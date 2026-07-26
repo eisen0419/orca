@@ -1640,6 +1640,83 @@ describe('OrcaRuntimeService', () => {
     expect(internals.ptysById.get('pty-1')?.hasEverReceivedExternalInput).toBe(true)
   })
 
+  it('persists the first external input fact for a renderer-owned terminal', async () => {
+    const markTerminalExternalInput = vi.fn()
+    const runtime = new OrcaRuntimeService({ ...store, markTerminalExternalInput })
+    runtime.setPtyController({
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+    syncSinglePty(runtime)
+    const [terminal] = (await runtime.listTerminals()).terminals
+
+    await runtime.sendTerminal(terminal.handle, { text: 'real input' })
+
+    expect(markTerminalExternalInput).toHaveBeenCalledWith(TEST_WORKTREE_ID, 'tab-1', undefined)
+  })
+
+  it('records the first accepted chunk even when a later terminal send fails', async () => {
+    let writes = 0
+    const runtime = new OrcaRuntimeService(store)
+    runtime.setPtyController({
+      write: () => (writes += 1) === 1,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+    syncSinglePty(runtime)
+    const [terminal] = (await runtime.listTerminals()).terminals
+    const internals = runtime as unknown as {
+      ptysById: Map<
+        string,
+        {
+          hasEverReceivedExternalInput: boolean
+          lastInputAt: number | null
+          activityGeneration: number
+        }
+      >
+    }
+
+    await expect(
+      runtime.sendTerminal(terminal.handle, { text: 'x'.repeat(200_000) })
+    ).rejects.toThrow('terminal_not_writable')
+
+    expect(internals.ptysById.get('pty-1')).toMatchObject({
+      hasEverReceivedExternalInput: true,
+      activityGeneration: 1
+    })
+    expect(internals.ptysById.get('pty-1')?.lastInputAt).toEqual(expect.any(Number))
+  })
+
+  it('advances hot activity for non-empty output and resets hydration grace', () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(1_000)
+      const runtime = new OrcaRuntimeService(store)
+      syncSinglePty(runtime)
+      const internals = runtime as unknown as {
+        ptysById: Map<
+          string,
+          { createdAt: number; lastActivityAt: number; activityGeneration: number }
+        >
+      }
+      expect(internals.ptysById.get('pty-1')).toMatchObject({
+        createdAt: 1_000,
+        lastActivityAt: 1_000,
+        activityGeneration: 0
+      })
+
+      vi.setSystemTime(2_000)
+      runtime.onPtyData('pty-1', 'prompt> ', 2_000)
+      expect(internals.ptysById.get('pty-1')).toMatchObject({
+        lastActivityAt: 2_000,
+        activityGeneration: 1
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('preserves graph provenance and the used fact when a stale graph omits them', () => {
     const runtime = new OrcaRuntimeService(store)
     const graph = (tab: Record<string, unknown>) => ({

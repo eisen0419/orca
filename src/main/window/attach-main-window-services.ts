@@ -377,6 +377,7 @@ function registerRuntimeWindowLifecycle(
       send('runtime:terminalFitOverrideChanged', { ptyId, mode, cols, rows }),
     terminalDriverChanged: (ptyId, driver) =>
       send('runtime:terminalDriverChanged', { ptyId, driver }),
+    terminalExternalInput: (event) => send('runtime:terminalExternalInput', event),
     browserDriverChanged: (browserPageId, driver) =>
       send('runtime:browserDriverChanged', { browserPageId, driver })
   })

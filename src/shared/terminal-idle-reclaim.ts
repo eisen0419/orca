@@ -1,4 +1,4 @@
-/** Provenance and conservative facts consumed by the idle-shell reclaim feature. */
+/** Missing provenance must stay exempt so upgrades never guess that a user shell is disposable. */
 export type TerminalCreationOrigin = 'user' | 'cli' | 'orchestration'
 
 export const DEFAULT_TERMINAL_IDLE_EMPTY_RECLAIM_MS = 60 * 60 * 1000

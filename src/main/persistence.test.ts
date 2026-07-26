@@ -4900,6 +4900,90 @@ describe('Store', () => {
     expect(updated.terminalIdleEmptyReclaimMs).toBe(5 * 60 * 1000)
   })
 
+  it('normalizes idle empty-shell reclaim settings while loading persisted data', async () => {
+    const cases = [
+      { value: undefined, expected: 60 * 60 * 1000 },
+      { value: 1, expected: 5 * 60 * 1000 },
+      { value: 8 * 24 * 60 * 60 * 1000, expected: 7 * 24 * 60 * 60 * 1000 },
+      { value: 'NaN', expected: 60 * 60 * 1000 },
+      { value: 30 * 60 * 1000, expected: 30 * 60 * 1000 }
+    ]
+
+    for (const { value, expected } of cases) {
+      writeFileSync(
+        join(testState.dir, 'orca-data.json'),
+        JSON.stringify({
+          settings: {
+            ...(value !== undefined ? { terminalIdleEmptyReclaimMs: value } : {}),
+            terminalIdleEmptyReclaimEnabled: false
+          }
+        })
+      )
+      const loaded = await createStore()
+      expect(loaded.getSettings()).toMatchObject({
+        terminalIdleEmptyReclaimEnabled: false,
+        terminalIdleEmptyReclaimMs: expected
+      })
+    }
+  })
+
+  it('persists headless terminal provenance and monotonic external input', async () => {
+    const store = await createStore()
+
+    store.persistPtyBinding({
+      worktreeId: 'wt-headless',
+      tabId: 'tab-headless',
+      leafId: TEST_LEAF_1,
+      ptyId: 'headless-pty',
+      creationOrigin: 'cli'
+    })
+    store.markTerminalExternalInput('wt-headless', 'tab-headless')
+
+    expect(store.getWorkspaceSession().tabsByWorktree['wt-headless']?.[0]).toMatchObject({
+      id: 'tab-headless',
+      ptyId: 'headless-pty',
+      creationOrigin: 'cli',
+      hasEverReceivedExternalInput: true
+    })
+  })
+
+  it('does not let a stale renderer session clear persisted terminal input', async () => {
+    const store = await createStore()
+    const session = {
+      activeRepoId: null,
+      activeWorktreeId: null,
+      activeTabId: null,
+      tabsByWorktree: {
+        wt: [
+          {
+            id: 'tab-used',
+            ptyId: 'pty-used',
+            worktreeId: 'wt',
+            title: 'Terminal',
+            customTitle: null,
+            color: null,
+            sortOrder: 0,
+            createdAt: 1,
+            creationOrigin: 'cli' as const,
+            hasEverReceivedExternalInput: true as const
+          }
+        ]
+      },
+      terminalLayoutsByTabId: {}
+    }
+    store.setWorkspaceSession(session)
+    store.setWorkspaceSession({
+      ...session,
+      tabsByWorktree: {
+        wt: session.tabsByWorktree.wt.map(({ hasEverReceivedExternalInput: _used, ...tab }) => tab)
+      }
+    })
+
+    expect(store.getWorkspaceSession().tabsByWorktree.wt[0]).toMatchObject({
+      hasEverReceivedExternalInput: true
+    })
+  })
+
   it('normalizes disabled TUI agents on load and update', async () => {
     writeFileSync(
       join(testState.dir, 'orca-data.json'),

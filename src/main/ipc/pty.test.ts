@@ -13061,6 +13061,35 @@ describe('registerPtyHandlers', () => {
     expect(recordExternalTerminalInput).toHaveBeenCalledTimes(1)
   })
 
+  it('records ordinary pty writes but excludes xterm query replies', async () => {
+    const mockProc = createMockProc()
+    spawnMock.mockReturnValue(mockProc.proc)
+    const recordExternalTerminalInput = vi.fn()
+    registerPtyHandlers(
+      mainWindow as never,
+      {
+        setPtyController: vi.fn(),
+        preAllocateHandleForPty: vi.fn(),
+        onPtySpawned: vi.fn(),
+        onPtyData: vi.fn(),
+        onPtyExit: vi.fn(),
+        getDriver: vi.fn(() => ({ kind: 'desktop' })),
+        recordExternalTerminalInput
+      } as never
+    )
+    const result = (await handlers.get('pty:spawn')!(null, {
+      cols: 80,
+      rows: 24
+    })) as { id: string }
+    const write = getPtyWriteListener() as (event: unknown, args: unknown) => void
+
+    write(mainWindowIpcEvent, { id: result.id, data: 'real input' })
+    write(mainWindowIpcEvent, { id: result.id, data: '\x1b[3;4R' })
+
+    expect(recordExternalTerminalInput).toHaveBeenCalledWith(result.id, 'external')
+    expect(recordExternalTerminalInput).toHaveBeenCalledWith(result.id, 'protocol-reply')
+  })
+
   it('rejects malformed and cross-window pty write IPC before provider writes', async () => {
     const mockProc = createMockProc()
     spawnMock.mockReturnValue(mockProc.proc)

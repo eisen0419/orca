@@ -3106,6 +3106,9 @@ export type PreloadApi = {
     onTerminalDriverChanged: (
       callback: (event: { ptyId: string; driver: RuntimeTerminalDriverState }) => void
     ) => () => void
+    onTerminalExternalInput: (
+      callback: (event: { ptyId: string; tabId: string }) => void
+    ) => () => void
     onBrowserDriverChanged: (
       callback: (event: { browserPageId: string; driver: RuntimeBrowserDriverState }) => void
     ) => () => void

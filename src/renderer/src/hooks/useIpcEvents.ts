@@ -3412,6 +3412,14 @@ export function useIpcEvents(): void {
       })
     )
 
+    if (window.api.runtime.onTerminalExternalInput) {
+      unsubs.push(
+        window.api.runtime.onTerminalExternalInput(({ ptyId, tabId }) => {
+          useAppStore.getState().markTerminalTabExternalInput(tabId, ptyId)
+        })
+      )
+    }
+
     unsubs.push(
       window.api.runtime.onBrowserDriverChanged((event) => {
         if (isRuntimeEnvironmentActive()) {

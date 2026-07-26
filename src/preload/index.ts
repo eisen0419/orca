@@ -4065,6 +4065,14 @@ const api = {
       ipcRenderer.on('runtime:terminalDriverChanged', listener)
       return () => ipcRenderer.removeListener('runtime:terminalDriverChanged', listener)
     },
+    onTerminalExternalInput: (callback) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        data: { ptyId: string; tabId: string }
+      ) => callback(data)
+      ipcRenderer.on('runtime:terminalExternalInput', listener)
+      return () => ipcRenderer.removeListener('runtime:terminalExternalInput', listener)
+    },
     onBrowserDriverChanged: (
       callback: (event: { browserPageId: string; driver: RuntimeBrowserDriverState }) => void
     ): (() => void) => {

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { z } from 'zod'
 import { parseWorkspaceSession } from './workspace-session-schema'
 import { MAX_BROWSER_HISTORY_ENTRIES } from './workspace-session-browser-history'
 
@@ -51,7 +52,7 @@ describe('parseWorkspaceSession', () => {
     expect(result.ok).toBe(true)
   })
 
-  it('round-trips optional terminal reclaim facts and tolerates legacy records', () => {
+  it('round-trips optional terminal reclaim facts, complete legacy terminal records, and frozen readers', () => {
     const base = {
       activeRepoId: null,
       activeWorktreeId: null,
@@ -77,7 +78,35 @@ describe('parseWorkspaceSession', () => {
         ]
       }
     })
-    const legacy = parseWorkspaceSession({ ...base, tabsByWorktree: { wt: [] } })
+    const legacy = parseWorkspaceSession({
+      ...base,
+      tabsByWorktree: {
+        wt: [
+          {
+            id: 'tab-legacy',
+            ptyId: 'legacy-pty',
+            worktreeId: 'wt',
+            title: 'Terminal 1',
+            defaultTitle: 'Terminal 1',
+            customTitle: null,
+            color: null,
+            sortOrder: 0,
+            createdAt: 1
+          }
+        ]
+      }
+    })
+    const frozenPreA1TerminalTab = z.object({
+      id: z.string(),
+      ptyId: z.string().nullable(),
+      worktreeId: z.string(),
+      title: z.string(),
+      defaultTitle: z.string().optional(),
+      customTitle: z.string().nullable(),
+      color: z.string().nullable(),
+      sortOrder: z.number(),
+      createdAt: z.number()
+    })
     expect(current.ok).toBe(true)
     expect(legacy.ok).toBe(true)
     if (current.ok) {
@@ -86,6 +115,15 @@ describe('parseWorkspaceSession', () => {
         hasEverReceivedExternalInput: true
       })
     }
+    if (legacy.ok) {
+      expect(legacy.value.tabsByWorktree.wt[0]).toMatchObject({
+        id: 'tab-legacy',
+        ptyId: 'legacy-pty'
+      })
+    }
+    expect(
+      frozenPreA1TerminalTab.parse(current.ok ? current.value.tabsByWorktree.wt[0] : null)
+    ).toEqual(expect.objectContaining({ id: 'tab-current', ptyId: null }))
   })
 
   it('rejects an invalid terminal creation origin without accepting a corrupted session', () => {

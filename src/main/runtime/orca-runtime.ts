@@ -990,6 +990,7 @@ type RuntimeStore = {
   readTerminalScrollbackSnapshot?: Store['readTerminalScrollbackSnapshot']
   flushOrThrow?: Store['flushOrThrow']
   persistPtyBinding?: Store['persistPtyBinding']
+  markTerminalExternalInput?: Store['markTerminalExternalInput']
   persistTerminalArchiveHint?: Store['persistTerminalArchiveHint']
   getSshRemotePtyLeases?: Store['getSshRemotePtyLeases']
   getUI?: Store['getUI']
@@ -1440,6 +1441,8 @@ type RuntimePtyController = {
     leafId?: string
     sessionId?: string
     persistHostSessionBinding?: boolean
+    creationOrigin?: TerminalCreationOrigin
+    hasEverReceivedExternalInput?: true
     terminalColorQueryReplies?: { foreground?: string; background?: string }
     agentSessionEnsure?: {
       claim: AgentSessionExecutionClaim
@@ -1575,6 +1578,7 @@ type RuntimeNotifier = {
   worktreesChanged(repoId: string, renamed?: { oldWorktreeId: string; newWorktreeId: string }): void
   worktreeBaseStatus?(event: WorktreeBaseStatusEvent): void
   worktreeRemoteBranchConflict?(event: WorktreeRemoteBranchConflictEvent): void
+  terminalExternalInput?(event: { ptyId: string; tabId: string }): void
   reposChanged(): void
   activateWorktree(
     repoId: string,
@@ -13647,6 +13651,8 @@ export class OrcaRuntimeService {
       tabId: parsed.tabId,
       leafId: parsed.leafId,
       focus: false,
+      ...(pty.creationOrigin ? { creationOrigin: pty.creationOrigin } : {}),
+      ...(pty.hasEverReceivedExternalInput ? { hasEverReceivedExternalInput: true as const } : {}),
       // Why: the HUB renderer may publish its exited layout while recovery is in flight; persist the replacement before that stale graph can orphan it.
       persistHostSessionBinding: true
     }).then((terminal) => ({
@@ -13748,6 +13754,7 @@ export class OrcaRuntimeService {
       reserveWrite?: (ptyId: string) => void
       afterWrite?: (ptyId: string) => void | Promise<void>
       suffixFailureError?: string
+      onWriteAccepted?: () => void
       inputKind?: 'external' | 'protocol-reply'
     } = {}
   ): Promise<RuntimeTerminalSend> {
@@ -13761,8 +13768,16 @@ export class OrcaRuntimeService {
         throw new Error('invalid_terminal_send')
       }
       await assertTerminalInputWithinLimitWithYield(action.text)
-      await this.writeTerminalAction(pty.pty.ptyId, action, payload, options)
-      this.recordExternalTerminalInput(pty.pty.ptyId, options.inputKind ?? 'external')
+      let recorded = false
+      await this.writeTerminalAction(pty.pty.ptyId, action, payload, {
+        ...options,
+        onWriteAccepted: () => {
+          if (!recorded) {
+            recorded = true
+            this.recordExternalTerminalInput(pty.pty.ptyId, options.inputKind ?? 'external')
+          }
+        }
+      })
       return {
         handle,
         accepted: true,
@@ -13780,8 +13795,16 @@ export class OrcaRuntimeService {
     }
     await assertTerminalInputWithinLimitWithYield(action.text)
 
-    await this.writeTerminalAction(leaf.ptyId, action, payload, options)
-    this.recordExternalTerminalInput(leaf.ptyId, options.inputKind ?? 'external')
+    let recorded = false
+    await this.writeTerminalAction(leaf.ptyId, action, payload, {
+      ...options,
+      onWriteAccepted: () => {
+        if (!recorded) {
+          recorded = true
+          this.recordExternalTerminalInput(leaf.ptyId!, options.inputKind ?? 'external')
+        }
+      }
+    })
 
     return {
       handle,
@@ -13806,8 +13829,16 @@ export class OrcaRuntimeService {
         throw new Error('terminal_not_writable')
       }
       await assertTerminalInputWithinLimitWithYield(payload)
-      await this.writeTerminalAgentPrompt(pty.pty.ptyId, payload, options)
-      this.recordExternalTerminalInput(pty.pty.ptyId, 'external')
+      let recorded = false
+      await this.writeTerminalAgentPrompt(pty.pty.ptyId, payload, {
+        ...options,
+        onWriteAccepted: () => {
+          if (!recorded) {
+            recorded = true
+            this.recordExternalTerminalInput(pty.pty.ptyId, 'external')
+          }
+        }
+      })
       return { handle, accepted: true, bytesWritten }
     }
 
@@ -13816,8 +13847,16 @@ export class OrcaRuntimeService {
       throw new Error('terminal_not_writable')
     }
     await assertTerminalInputWithinLimitWithYield(payload)
-    await this.writeTerminalAgentPrompt(leaf.ptyId, payload, options)
-    this.recordExternalTerminalInput(leaf.ptyId, 'external')
+    let recorded = false
+    await this.writeTerminalAgentPrompt(leaf.ptyId, payload, {
+      ...options,
+      onWriteAccepted: () => {
+        if (!recorded) {
+          recorded = true
+          this.recordExternalTerminalInput(leaf.ptyId!, 'external')
+        }
+      }
+    })
     return { handle, accepted: true, bytesWritten }
   }
 
@@ -14167,6 +14206,7 @@ export class OrcaRuntimeService {
       reserveWrite?: (ptyId: string) => void
       afterWrite?: (ptyId: string) => void | Promise<void>
       suffixFailureError?: string
+      onWriteAccepted?: () => void
     } = {}
   ): Promise<void> {
     // Why: direct terminal.send can carry paste-sized text from RPC/mobile
@@ -14194,6 +14234,7 @@ export class OrcaRuntimeService {
       if (!suffixWrote) {
         throw new Error(options.suffixFailureError ?? 'terminal_not_writable')
       }
+      options.onWriteAccepted?.()
       await options.afterWrite?.(ptyId)
       return
     }
@@ -14207,6 +14248,7 @@ export class OrcaRuntimeService {
     if (!wrote) {
       throw new Error('terminal_not_writable')
     }
+    options.onWriteAccepted?.()
     await options.afterWrite?.(ptyId)
   }
 
@@ -14217,6 +14259,7 @@ export class OrcaRuntimeService {
       beforeWrite?: (ptyId: string) => void | Promise<void>
       reserveWrite?: (ptyId: string) => void
       afterWrite?: (ptyId: string) => void | Promise<void>
+      onWriteAccepted?: () => void
     } = {}
   ): Promise<void> {
     const chunks = iterateTerminalInputChunks(text)
@@ -14228,6 +14271,7 @@ export class OrcaRuntimeService {
       if (!wrote) {
         throw new Error('terminal_not_writable')
       }
+      options.onWriteAccepted?.()
       await options.afterWrite?.(ptyId)
       chunk = chunks.next()
       if (!chunk.done) {
@@ -14242,6 +14286,7 @@ export class OrcaRuntimeService {
     options: {
       beforeWrite?: (ptyId: string) => void | Promise<void>
       suffixFailureError?: string
+      onWriteAccepted?: () => void
     } = {}
   ): Promise<void> {
     let wrotePasteBytes = false
@@ -14255,6 +14300,7 @@ export class OrcaRuntimeService {
         if (!wrote) {
           throw new Error('terminal_not_writable')
         }
+        options.onWriteAccepted?.()
         wrotePasteBytes = true
         chunk = chunks.next()
         if (!chunk.done) {
@@ -14282,6 +14328,7 @@ export class OrcaRuntimeService {
     if (!suffixWrote) {
       throw new Error(options.suffixFailureError ?? 'terminal_not_writable')
     }
+    options.onWriteAccepted?.()
   }
 
   async waitForTerminal(
@@ -18143,10 +18190,13 @@ export class OrcaRuntimeService {
           console.warn('[worktree-create] agent did not become ready for draft paste')
           return
         }
-        this.ptyController?.write(
+        const wrote = this.ptyController?.write(
           ptyId,
           `${BRACKETED_PASTE_BEGIN}${draft.content}${BRACKETED_PASTE_END}`
         )
+        if (wrote) {
+          this.recordExternalTerminalInput(ptyId, 'external')
+        }
       })
       .catch((error) => {
         console.warn('[worktree-create] failed to paste startup draft:', error)
@@ -18160,7 +18210,10 @@ export class OrcaRuntimeService {
           console.warn('[worktree-create] agent did not become ready for follow-up prompt')
           return
         }
-        this.ptyController?.write(ptyId, `${followup.prompt}\r`)
+        const wrote = this.ptyController?.write(ptyId, `${followup.prompt}\r`)
+        if (wrote) {
+          this.recordExternalTerminalInput(ptyId, 'external')
+        }
       })
       .catch((error) => {
         console.warn('[worktree-create] failed to send startup follow-up prompt:', error)
@@ -21862,6 +21915,13 @@ export class OrcaRuntimeService {
         preAllocatedHandle,
         tabId,
         leafId,
+        creationOrigin: launchOpts.creationOrigin ?? 'user',
+        ...(launchOpts.command?.trim() ||
+        effectiveLaunchConfig ||
+        launchOpts.resumeProviderSession ||
+        launchOpts.launchAgent
+          ? { hasEverReceivedExternalInput: true as const }
+          : {}),
         ...(terminalColorQueryReplies ? { terminalColorQueryReplies } : {}),
         ...(launchOpts.agentSessionClaim
           ? {
@@ -25325,6 +25385,11 @@ export class OrcaRuntimeService {
     pty.lastActivityAt = Math.max(pty.lastActivityAt, now)
     pty.hasEverReceivedExternalInput = true
     pty.activityGeneration += 1
+    if (pty.tabId) {
+      const hostId = this.store?.getWorkspaceSessionHostIdForWorktree?.(pty.worktreeId)
+      this.store?.markTerminalExternalInput?.(pty.worktreeId, pty.tabId, hostId)
+      this.notifier?.terminalExternalInput?.({ ptyId, tabId: pty.tabId })
+    }
   }
 
   private getOrCreatePtyWorktreeRecord(ptyId: string): RuntimePtyWorktreeRecord | null {
@@ -25470,6 +25535,17 @@ export class OrcaRuntimeService {
             ? { tabId: persistedSurface.tabId, paneKey: persistedSurface.paneKey }
             : {})
         })
+        if (restoresExactSurface) {
+          const persistedTab = this.getWorkspaceSessionForWorktree(worktreeId)?.tabsByWorktree[
+            worktreeId
+          ]?.find((tab) => tab.id === persistedSurface.tabId)
+          if (pty.creationOrigin === null && persistedTab?.creationOrigin) {
+            pty.creationOrigin = persistedTab.creationOrigin
+          }
+          if (persistedTab?.hasEverReceivedExternalInput === true) {
+            pty.hasEverReceivedExternalInput = true
+          }
+        }
         pty.controllerTitle = session.title?.trim() || null
       }
       // Why: fire-and-forget so this listing hot path doesn't serialize a relay round-trip per session and a throw can't abort the sweep below.
@@ -27499,6 +27575,7 @@ export class OrcaRuntimeService {
     if (!wrote) {
       return
     }
+    this.recordExternalTerminalInput(leaf.ptyId, 'external')
 
     // The active coordinator prompt is user-owned input, so push-on-idle must not synthesize Enter.
     if (this._orchestrationDb.getActiveCoordinatorRun()?.coordinator_handle === handle) {
@@ -27523,6 +27600,7 @@ export class OrcaRuntimeService {
         }
         const submitted = this.ptyController?.write(ptyId, '\r') ?? false
         if (submitted) {
+          this.recordExternalTerminalInput(ptyId, 'external')
           this._orchestrationDb?.markAsDelivered(unread.map((m) => m.id))
         }
       } catch {

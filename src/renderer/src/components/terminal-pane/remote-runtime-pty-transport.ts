@@ -1867,6 +1867,7 @@ export function createRemoteRuntimePtyTransport(
       void callRuntime('terminal.send', {
         terminal: targetHandle,
         text,
+        inputKind: 'query-reply',
         client: { id: clientId, type: 'desktop' },
         ...(desiredViewport ? { viewport: desiredViewport, claimViewport: true as const } : {})
       }).catch((error) => {

@@ -108,7 +108,10 @@ import {
   ONBOARDING_FLOW_VERSION,
   ONBOARDING_FINAL_STEP
 } from '../shared/constants'
-import { normalizeTerminalIdleEmptyReclaimMs } from '../shared/terminal-idle-reclaim'
+import {
+  normalizeTerminalIdleEmptyReclaimMs,
+  type TerminalCreationOrigin
+} from '../shared/terminal-idle-reclaim'
 import { parseWorkspaceSession } from '../shared/workspace-session-schema'
 import { normalizeUsagePercentageDisplay } from '../shared/usage-percentage-display'
 import { normalizeStatusBarUsageMode } from '../shared/status-bar-usage-mode'
@@ -2398,6 +2401,8 @@ function createMinimalPersistedTerminalTab(args: {
   ptyId: string
   existingTabCount: number
   startupCwd?: string
+  creationOrigin?: TerminalCreationOrigin
+  hasEverReceivedExternalInput?: true
 }): TerminalTab {
   const ordinal = args.existingTabCount + 1
   const defaultTitle = `Terminal ${ordinal}`
@@ -2411,6 +2416,10 @@ function createMinimalPersistedTerminalTab(args: {
     color: null,
     sortOrder: args.existingTabCount,
     createdAt: Date.now(),
+    ...(args.creationOrigin ? { creationOrigin: args.creationOrigin } : {}),
+    ...(args.hasEverReceivedExternalInput === true
+      ? { hasEverReceivedExternalInput: true as const }
+      : {}),
     ...(args.startupCwd ? { startupCwd: args.startupCwd } : {}),
     pendingActivationSpawn: true
   }
@@ -2418,6 +2427,29 @@ function createMinimalPersistedTerminalTab(args: {
 
 function cloneWorkspaceSessionState(session: WorkspaceSessionState): WorkspaceSessionState {
   return structuredClone(session)
+}
+
+function preservePersistedTerminalExternalInput(
+  session: WorkspaceSessionState,
+  prior: WorkspaceSessionState | undefined
+): WorkspaceSessionState {
+  if (!prior) {
+    return session
+  }
+  for (const [worktreeId, tabs] of Object.entries(session.tabsByWorktree ?? {})) {
+    const priorTabs = prior.tabsByWorktree?.[worktreeId] ?? []
+    for (const tab of tabs) {
+      if (
+        tab.hasEverReceivedExternalInput !== true &&
+        priorTabs.some(
+          (priorTab) => priorTab.id === tab.id && priorTab.hasEverReceivedExternalInput === true
+        )
+      ) {
+        tab.hasEverReceivedExternalInput = true
+      }
+    }
+  }
+  return session
 }
 
 /**
@@ -5995,6 +6027,7 @@ export class Store {
     session = reseedMainOwnedPtyIncarnations(session, prior)
     // Why: each partition owns its topology fence; renderer writes omit it and must rebase locally.
     session = sanitizeWorkspaceSessionTerminalRetirements(session, prior)
+    session = preservePersistedTerminalExternalInput(session, prior)
     const incoming = session.terminalArchiveHintsByPaneKey ?? {}
     const incomingHasAnyHint = Object.keys(incoming).length > 0
     if (!incomingHasAnyHint && prior?.terminalArchiveHintsByPaneKey) {
@@ -6015,6 +6048,7 @@ export class Store {
     const prior = this.state.workspaceSession
     session = reseedMainOwnedPtyIncarnations(session, prior)
     session = sanitizeWorkspaceSessionTerminalRetirements(session, prior)
+    session = preservePersistedTerminalExternalInput(session, prior)
     session = pruneWorkspaceSessionBrowserHistory(
       pruneLocalTerminalScrollbackBuffers(session, this.state.repos)
     )
@@ -6319,6 +6353,8 @@ export class Store {
       ptyId: string
       incarnationId?: string
       startupCwd?: string
+      creationOrigin?: TerminalCreationOrigin
+      hasEverReceivedExternalInput?: true
       archiveHint?: {
         hint: Partial<TerminalArchiveHint>
         source: TerminalArchiveHintSource
@@ -6375,6 +6411,12 @@ export class Store {
     const tab = tabs?.find((t) => t.id === args.tabId)
     if (tab) {
       tab.ptyId = args.ptyId
+      if (!tab.creationOrigin && args.creationOrigin) {
+        tab.creationOrigin = args.creationOrigin
+      }
+      if (args.hasEverReceivedExternalInput === true) {
+        tab.hasEverReceivedExternalInput = true
+      }
     } else {
       terminalMembershipChanged = true
       // Why: pty:spawn can beat the debounced writer; persist a minimal tab so hydration won't prune the binding as orphaned.
@@ -6461,6 +6503,37 @@ export class Store {
     } catch (err) {
       restoreSession()
       throw err
+    }
+  }
+
+  /** Main owns this write when no renderer session writer can preserve the monotonic fact. */
+  markTerminalExternalInput(worktreeId: string, tabId: string, hostId?: string | null): void {
+    const resolvedHostId = this.resolveHostId(hostId)
+    const session = this.getWorkspaceSession(resolvedHostId)
+    const tab = session.tabsByWorktree?.[worktreeId]?.find((candidate) => candidate.id === tabId)
+    if (!tab || tab.hasEverReceivedExternalInput === true) {
+      return
+    }
+    const previous = cloneWorkspaceSessionState(session)
+    tab.hasEverReceivedExternalInput = true
+    if (resolvedHostId !== LOCAL_EXECUTION_HOST_ID) {
+      this.state.workspaceSessionsByHostId = {
+        ...this.state.workspaceSessionsByHostId,
+        [resolvedHostId]: session
+      }
+    }
+    try {
+      this.flushOrThrow()
+    } catch (error) {
+      if (resolvedHostId === LOCAL_EXECUTION_HOST_ID) {
+        this.state.workspaceSession = previous
+      } else {
+        this.state.workspaceSessionsByHostId = {
+          ...this.state.workspaceSessionsByHostId,
+          [resolvedHostId]: previous
+        }
+      }
+      throw error
     }
   }
 

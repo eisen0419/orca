@@ -1330,6 +1330,7 @@ function createRuntimeApi(): NonNullable<Partial<PreloadApi>['runtime']> {
     reclaimBrowserForDesktop: () => Promise.resolve({ reclaimed: false }),
     onTerminalFitOverrideChanged: () => noopUnsubscribe,
     onTerminalDriverChanged: () => noopUnsubscribe,
+    onTerminalExternalInput: () => noopUnsubscribe,
     onBrowserDriverChanged: () => noopUnsubscribe
   }
 }

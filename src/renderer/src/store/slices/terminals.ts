@@ -593,6 +593,7 @@ export type TerminalSlice = {
   setActiveTab: (tabId: string) => void
   setActiveTabForWorktree: (worktreeId: string, tabId: string) => void
   updateTabTitle: (tabId: string, title: string) => void
+  markTerminalTabExternalInput: (tabId: string, ptyId?: string) => void
   setGeneratedTabTitleFromAgentPrompt: (
     paneKey: string,
     prompt: string,
@@ -1606,6 +1607,33 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
         }
       }
       return nextState
+    })
+  },
+
+  markTerminalTabExternalInput: (tabId, ptyId) => {
+    set((s) => {
+      const ownerWorktreeId = getTerminalTabOwnerWorktreeId(s.tabsByWorktree, tabId)
+      if (!ownerWorktreeId) {
+        return s
+      }
+      const tabs = s.tabsByWorktree[ownerWorktreeId] ?? []
+      const current = tabs.find((tab) => tab.id === tabId)
+      if (
+        !current ||
+        current.hasEverReceivedExternalInput === true ||
+        (ptyId !== undefined &&
+          current.ptyId !== ptyId &&
+          !(s.ptyIdsByTabId[tabId] ?? []).includes(ptyId))
+      ) {
+        return s
+      }
+      const nextTabs = tabs.map((tab) =>
+        tab.id === tabId ? { ...tab, hasEverReceivedExternalInput: true as const } : tab
+      )
+      scheduleRuntimeGraphSync()
+      return {
+        tabsByWorktree: { ...s.tabsByWorktree, [ownerWorktreeId]: nextTabs }
+      }
     })
   },
 
