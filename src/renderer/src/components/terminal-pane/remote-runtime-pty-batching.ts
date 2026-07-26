@@ -33,7 +33,7 @@ export const REMOTE_RUNTIME_PTY_VALIDATION_QUEUE_MAX_ENTRIES = 4_096
 
 export function createRemoteRuntimePtyTextBatcher(
   delayMs: number,
-  onFlush: (text: string, inputKind: RemoteRuntimePtyInputKind) => unknown,
+  onFlush: (text: string, inputKind: RemoteRuntimePtyInputKind) => void,
   options: RemoteRuntimePtyTextBatcherOptions = {}
 ): RemoteRuntimePtyBatcher {
   const maxPendingBytes = getPositiveByteLimit(
@@ -52,9 +52,6 @@ export function createRemoteRuntimePtyTextBatcher(
   let pending: { text: string; inputKind: RemoteRuntimePtyInputKind }[] = []
   let pendingBytes = 0
   let timer: ReturnType<typeof setTimeout> | null = null
-  let inFlight: Promise<void> | null = null
-  let flushRequestedWhileInFlight = false
-  let pendingVersion = 0
   let validationTail: Promise<void> | null = null
   let validationVersion = 0
   let validationQueuedCodeUnits = 0
@@ -71,8 +68,6 @@ export function createRemoteRuntimePtyTextBatcher(
     clearTimer()
     pending = []
     pendingBytes = 0
-    pendingVersion += 1
-    flushRequestedWhileInFlight = false
     validationVersion += 1
     validationTail = null
     validationQueuedCodeUnits = 0
@@ -81,10 +76,6 @@ export function createRemoteRuntimePtyTextBatcher(
 
   const flush = (): void => {
     clearTimer()
-    if (inFlight) {
-      flushRequestedWhileInFlight = true
-      return
-    }
     const entries = takePendingEntries()
     if (entries.length === 0) {
       return
@@ -93,43 +84,7 @@ export function createRemoteRuntimePtyTextBatcher(
     const inputKind = entries.some((entry) => entry.inputKind === 'external')
       ? 'external'
       : 'query-reply'
-    const version = pendingVersion
-    let result: unknown
-    try {
-      result = onFlush(text, inputKind)
-    } catch {
-      restorePendingEntries(entries, version)
-      return
-    }
-    if (!isPromiseLike(result)) {
-      if (result === false) {
-        restorePendingEntries(entries, version)
-      }
-      return
-    }
-    const currentFlight = Promise.resolve(result)
-      .then((accepted) => {
-        if (accepted === false) {
-          restorePendingEntries(entries, version)
-        }
-      })
-      .catch(() => {
-        restorePendingEntries(entries, version)
-      })
-      .finally(() => {
-        if (inFlight !== currentFlight) {
-          return
-        }
-        inFlight = null
-        if (flushRequestedWhileInFlight) {
-          flushRequestedWhileInFlight = false
-          flush()
-        }
-      })
-    inFlight = currentFlight
-    if (pending.length > 0) {
-      flushRequestedWhileInFlight = true
-    }
+    onFlush(text, inputKind)
   }
 
   const takePending = (): string => {
@@ -156,23 +111,6 @@ export function createRemoteRuntimePtyTextBatcher(
     }
     clearTimer()
     return entries
-  }
-
-  const restorePendingEntries = (
-    entries: { text: string; inputKind: RemoteRuntimePtyInputKind }[],
-    version: number
-  ): void => {
-    if (entries.length === 0 || pendingVersion !== version) {
-      return
-    }
-    pending = [...entries, ...pending]
-    pendingBytes += entries.reduce(
-      (total, entry) => total + getTerminalInputByteLength(entry.text),
-      0
-    )
-    if (!timer) {
-      timer = setTimeout(flush, delayMs)
-    }
   }
 
   const queuePending = (
@@ -279,10 +217,6 @@ export function createRemoteRuntimePtyTextBatcher(
     flush,
     clear
   }
-}
-
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  return typeof (value as { then?: unknown } | null | undefined)?.then === 'function'
 }
 
 function getPositiveByteLimit(value: number | undefined, fallback: number): number {

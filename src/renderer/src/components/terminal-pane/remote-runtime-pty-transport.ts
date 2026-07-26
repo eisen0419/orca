@@ -967,32 +967,29 @@ export function createRemoteRuntimePtyTransport(
 
   const inputBatcher = createRemoteRuntimePtyTextBatcher(
     REMOTE_TERMINAL_INPUT_FLUSH_MS,
-    async (text, inputKind) => {
+    (text, inputKind) => {
       const targetHandle = handle
       if (!connected || !targetHandle || recoveryBlocksIo()) {
-        return true
+        return
       }
       const stream = getCurrentMultiplexedStream(targetHandle)
       if (stream?.sendInput(text, inputKind === 'query-reply' ? inputKind : undefined)) {
-        return true
+        return
       }
       if (pendingViewportClaim) {
         // Why: a claim during subscribe/reconnect has no stream record yet; hold its input so the stream emits claim+input in one order.
-        return pendingClaimInput.append(text, inputKind)
+        pendingClaimInput.append(text, inputKind)
+        return
       }
-      try {
-        const result = await callRuntime<{ send: RuntimeTerminalSend }>('terminal.send', {
-          terminal: targetHandle,
-          text,
-          ...(inputKind === 'query-reply' ? { inputKind } : {}),
-          client: { id: clientId, type: 'desktop' },
-          ...(desiredViewport ? { viewport: desiredViewport, claimViewport: true as const } : {})
-        })
-        return result.send.accepted === true
-      } catch (error) {
+      void callRuntime('terminal.send', {
+        terminal: targetHandle,
+        text,
+        ...(inputKind === 'query-reply' ? { inputKind } : {}),
+        client: { id: clientId, type: 'desktop' },
+        ...(desiredViewport ? { viewport: desiredViewport, claimViewport: true as const } : {})
+      }).catch((error) => {
         handleRemoteTerminalError(error)
-        return false
-      }
+      })
     }
   )
 
