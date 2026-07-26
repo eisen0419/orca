@@ -417,7 +417,14 @@ describe('OrcaRuntimeService idle empty-terminal reclaim remaining checkpoint ne
     const candidate = collectSnapshotCandidate(internals, pty)
 
     expect(getActiveDispatchAssignees).not.toHaveBeenCalled()
-    expect(candidate).toMatchObject({ hasOrchestrationOwnership: null })
+    // Why: hasOrchestrationOwnership is null because orchestration is skipped, which says
+    // nothing about the sleeping set. hasInFlightTransaction is the fact this checkpoint
+    // protects: a partially filled sleeping set would report false, turning unknown
+    // transaction state into an apparently safe one.
+    expect(candidate).toMatchObject({
+      hasOrchestrationOwnership: null,
+      hasInFlightTransaction: null
+    })
     runtime.dispose()
   })
 })
