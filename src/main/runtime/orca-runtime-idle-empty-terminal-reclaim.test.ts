@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { getDefaultWorkspaceSession } from '../../shared/constants'
 import type { TerminalTab, WorkspaceSessionState } from '../../shared/types'
 import { IdleEmptyTerminalReclaimScheduler } from '../idle-empty-terminal-reclaim-scheduler'
-import type { IdleEmptyTerminalReclaimCandidate } from './idle-empty-terminal-reclaim'
+import {
+  evaluateIdleReclaimCandidate,
+  type IdleEmptyTerminalReclaimCandidate
+} from './idle-empty-terminal-reclaim'
 import { OrcaRuntimeService } from './orca-runtime'
 
 const WORKTREE_ID = 'worktree-1'
@@ -35,6 +38,9 @@ type RuntimeIdleReclaimInternals = {
   }
   tabs: Map<string, unknown>
   leaves: Map<string, unknown>
+  graphStatus: 'unavailable' | 'reloading' | 'ready'
+  authoritativeWindowId: number | null
+  setDriver: (ptyId: string, next: { kind: 'idle' | 'desktop' }) => void
 }
 
 function makeStore(enabled: boolean, session: WorkspaceSessionState | null = null) {
@@ -114,6 +120,83 @@ function fullyEligibleCandidate(): IdleEmptyTerminalReclaimCandidate {
   }
 }
 
+function expectedCollectedCandidate(args: {
+  tabId: string
+  leafId: string
+  ptyId: string
+  incarnationId: string
+  lastActivityAt: number
+  overrides?: Partial<IdleEmptyTerminalReclaimCandidate>
+}): IdleEmptyTerminalReclaimCandidate {
+  return {
+    tabId: args.tabId,
+    leafId: args.leafId,
+    ptyId: args.ptyId,
+    worktreeId: WORKTREE_ID,
+    incarnationId: args.incarnationId,
+    expectedIncarnationId: args.incarnationId,
+    activityGeneration: 0,
+    expectedActivityGeneration: 0,
+    isSinglePane: null,
+    hasExactTabLeafPtyWorktreeBinding: true,
+    hasSharedPty: false,
+    isPersisted: false,
+    rendererOwnsPersistedTab: false,
+    origin: 'cli',
+    used: false,
+    isPinned: null,
+    isSleepingOrHibernating: null,
+    hasPendingRestoreOrReconnect: null,
+    hasStartupCommand: null,
+    hasLaunchConfig: null,
+    hasResumeProviderSession: null,
+    hasLaunchAgent: null,
+    hasForegroundAgent: false,
+    agentStatus: null,
+    hasProviderSession: null,
+    hasOrchestrationOwnership: null,
+    lastActivityAt: args.lastActivityAt,
+    providerConnected: true,
+    providerWritable: null,
+    inspection: { status: 'success', foregroundProcess: 'shell', hasChildProcesses: false },
+    rendererVisibility: null,
+    hasMobileDriver: false,
+    hasMobileSubscriber: false,
+    hasRemoteDesktopViewer: false,
+    isActiveCoordinatorHandle: null,
+    hasPendingOrDispatchedContext: null,
+    hasInFlightTransaction: false,
+    hasSecondConfirmation: null,
+    hasExactIdentityClaim: null,
+    ...args.overrides
+  }
+}
+
+function withOnlyLiveActivityFact(
+  candidate: IdleEmptyTerminalReclaimCandidate
+): IdleEmptyTerminalReclaimCandidate {
+  return {
+    ...fullyEligibleCandidate(),
+    incarnationId: candidate.incarnationId,
+    expectedIncarnationId: candidate.expectedIncarnationId,
+    activityGeneration: candidate.activityGeneration,
+    expectedActivityGeneration: candidate.expectedActivityGeneration
+  }
+}
+
+function withCollectedTopologyFacts(
+  candidate: IdleEmptyTerminalReclaimCandidate
+): IdleEmptyTerminalReclaimCandidate {
+  return {
+    ...fullyEligibleCandidate(),
+    isSinglePane: candidate.isSinglePane,
+    hasExactTabLeafPtyWorktreeBinding: candidate.hasExactTabLeafPtyWorktreeBinding,
+    hasSharedPty: candidate.hasSharedPty,
+    isPersisted: candidate.isPersisted,
+    rendererOwnsPersistedTab: candidate.rendererOwnsPersistedTab
+  }
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
 })
@@ -169,6 +252,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
     }
     const runtime = new OrcaRuntimeService(makeStore(true, session) as never)
     const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
     runtime.setPtyController({
       spawn: vi.fn(),
       write: vi.fn(() => true),
@@ -217,20 +301,381 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
 
     const candidates = await internals.collectIdleEmptyTerminalReclaimCandidates()
 
-    expect(candidates.find((candidate) => candidate.ptyId === 'pty-renderer')).toMatchObject({
-      isPersisted: true,
-      rendererOwnsPersistedTab: true
+    expect(candidates).toEqual([
+      expectedCollectedCandidate({
+        tabId: TAB_ID,
+        leafId: LEAF_ID,
+        ptyId: 'pty-renderer',
+        incarnationId: 'renderer-incarnation',
+        lastActivityAt: rendererPty.lastActivityAt,
+        overrides: {
+          isSinglePane: true,
+          isPersisted: true,
+          rendererOwnsPersistedTab: true,
+          isPinned: false,
+          isSleepingOrHibernating: false,
+          providerWritable: true
+        }
+      }),
+      expectedCollectedCandidate({
+        tabId: RUNTIME_TAB_ID,
+        leafId: RUNTIME_LEAF_ID,
+        ptyId: 'pty-runtime',
+        incarnationId: 'runtime-incarnation',
+        lastActivityAt: runtimePty.lastActivityAt,
+        overrides: {
+          isSinglePane: true,
+          isPersisted: true,
+          isPinned: false,
+          isSleepingOrHibernating: false
+        }
+      }),
+      expectedCollectedCandidate({
+        tabId: HOT_TAB_ID,
+        leafId: HOT_LEAF_ID,
+        ptyId: 'pty-hot',
+        incarnationId: 'hot-incarnation',
+        lastActivityAt: hotPty.lastActivityAt
+      })
+    ])
+    runtime.dispose()
+  })
+
+  it.each([
+    {
+      seam: 'renderer graph invalidation',
+      mutate: (runtime: OrcaRuntimeService, internals: RuntimeIdleReclaimInternals) => {
+        internals.authoritativeWindowId = 1
+        internals.graphStatus = 'ready'
+        runtime.markGraphUnavailable(1)
+      }
+    },
+    {
+      seam: 'driver takeover',
+      mutate: (_runtime: OrcaRuntimeService, internals: RuntimeIdleReclaimInternals) => {
+        internals.setDriver('pty-race', { kind: 'desktop' })
+      }
+    },
+    {
+      seam: 'PTY exit',
+      mutate: (runtime: OrcaRuntimeService) => {
+        runtime.onPtyExit('pty-race', 0)
+      }
+    },
+    {
+      seam: 'pane rebinding',
+      mutate: (_runtime: OrcaRuntimeService, internals: RuntimeIdleReclaimInternals) => {
+        internals.recordPtyWorktree('pty-race', WORKTREE_ID, {
+          tabId: RUNTIME_TAB_ID,
+          paneKey: RUNTIME_PANE_KEY
+        })
+      }
+    }
+  ])(
+    'returns the exact stale-activity refusal when $seam changes during inspection',
+    async ({ mutate }) => {
+      let resolveInspection!: (value: {
+        foregroundProcess: string
+        hasChildProcesses: boolean
+      }) => void
+      const inspectProcess = vi.fn(
+        () =>
+          new Promise<{ foregroundProcess: string; hasChildProcesses: boolean }>((resolve) => {
+            resolveInspection = resolve
+          })
+      )
+      const runtime = new OrcaRuntimeService(makeStore(true) as never)
+      const internals = runtime as unknown as RuntimeIdleReclaimInternals
+      runtime.setPtyController({
+        spawn: vi.fn(),
+        write: vi.fn(() => true),
+        kill: vi.fn(() => true),
+        getForegroundProcess: vi.fn(async () => 'zsh'),
+        inspectProcess
+      })
+      const pty = internals.recordPtyWorktree('pty-race', WORKTREE_ID, {
+        connected: true,
+        incarnationId: 'race-incarnation',
+        tabId: HOT_TAB_ID,
+        paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+      })
+      pty.creationOrigin = 'cli'
+
+      const pendingCandidate = internals.collectIdleEmptyTerminalReclaimCandidates()
+      await vi.waitFor(() => expect(inspectProcess).toHaveBeenCalledOnce())
+      mutate(runtime, internals)
+      resolveInspection({ foregroundProcess: 'zsh', hasChildProcesses: false })
+      const [candidate] = await pendingCandidate
+
+      expect(candidate?.activityGeneration).not.toBe(candidate?.expectedActivityGeneration)
+      expect(
+        evaluateIdleReclaimCandidate(
+          withOnlyLiveActivityFact(candidate!),
+          { enabled: true },
+          60 * 60 * 1000
+        )
+      ).toEqual({ eligible: false, reason: 'not-idle-or-activity-stale' })
+      runtime.dispose()
+    }
+  )
+
+  it('refuses renderer ownership when graph, session, or hot-only identity authority is unavailable', async () => {
+    const session = getDefaultWorkspaceSession()
+    const runtime = new OrcaRuntimeService(makeStore(true, session) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
     })
-    expect(candidates.find((candidate) => candidate.ptyId === 'pty-runtime')).toMatchObject({
-      isPersisted: true,
-      rendererOwnsPersistedTab: false
+    const pty = internals.recordPtyWorktree('pty-unknown', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'unknown-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${RUNTIME_TAB_ID}:${HOT_LEAF_ID}`
     })
-    expect(candidates.find((candidate) => candidate.ptyId === 'pty-hot')).toMatchObject({
+    pty.creationOrigin = 'cli'
+
+    const [unavailableGraph] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+    expect(unavailableGraph).toMatchObject({
+      isPersisted: false,
+      rendererOwnsPersistedTab: null,
+      hasExactTabLeafPtyWorktreeBinding: null,
+      hasSharedPty: null
+    })
+
+    internals.graphStatus = 'ready'
+    const [mismatchedPane] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+    expect(mismatchedPane).toMatchObject({
       isPersisted: false,
       rendererOwnsPersistedTab: false,
-      isPinned: null,
-      rendererVisibility: null
+      hasExactTabLeafPtyWorktreeBinding: null,
+      hasSharedPty: false
     })
+    runtime.dispose()
+
+    const sessionlessRuntime = new OrcaRuntimeService(makeStore(true) as never)
+    const sessionlessInternals = sessionlessRuntime as unknown as RuntimeIdleReclaimInternals
+    sessionlessInternals.graphStatus = 'ready'
+    sessionlessRuntime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
+    })
+    const sessionlessPty = sessionlessInternals.recordPtyWorktree('pty-sessionless', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'sessionless-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    sessionlessPty.creationOrigin = 'cli'
+
+    const [sessionlessCandidate] =
+      await sessionlessInternals.collectIdleEmptyTerminalReclaimCandidates()
+    expect(sessionlessCandidate).toMatchObject({
+      isPersisted: null,
+      rendererOwnsPersistedTab: null,
+      hasSharedPty: null
+    })
+    sessionlessRuntime.dispose()
+  })
+
+  it('marks cross-tab persisted PTY references shared', async () => {
+    const session = getDefaultWorkspaceSession()
+    session.tabsByWorktree[WORKTREE_ID] = [
+      persistedTerminalTab(),
+      runtimeOwnedPersistedTerminalTab()
+    ]
+    session.terminalLayoutsByTabId[TAB_ID] = {
+      root: { type: 'leaf', leafId: LEAF_ID },
+      activeLeafId: LEAF_ID,
+      expandedLeafId: null,
+      ptyIdsByLeafId: { [LEAF_ID]: 'pty-shared' }
+    }
+    session.terminalLayoutsByTabId[RUNTIME_TAB_ID] = {
+      root: { type: 'leaf', leafId: RUNTIME_LEAF_ID },
+      activeLeafId: RUNTIME_LEAF_ID,
+      expandedLeafId: null,
+      ptyIdsByLeafId: { [RUNTIME_LEAF_ID]: 'pty-shared' }
+    }
+    const runtime = new OrcaRuntimeService(makeStore(true, session) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
+    })
+    const pty = internals.recordPtyWorktree('pty-shared', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'shared-incarnation',
+      tabId: TAB_ID,
+      paneKey: PANE_KEY
+    })
+    pty.creationOrigin = 'cli'
+
+    const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(candidate).toMatchObject({ isPersisted: true, hasSharedPty: true })
+    expect(
+      evaluateIdleReclaimCandidate(
+        withCollectedTopologyFacts(candidate!),
+        { enabled: true },
+        60 * 60 * 1000
+      )
+    ).toEqual({
+      eligible: false,
+      reason: 'topology-or-binding-invalid'
+    })
+    runtime.dispose()
+  })
+
+  it('leaves orchestration facts null when lazy DB initialization cannot be established', async () => {
+    const runtime = new OrcaRuntimeService(makeStore(true) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
+    })
+    vi.spyOn(runtime, 'getOrchestrationDb').mockImplementation(() => {
+      throw new Error('db unavailable')
+    })
+    const pty = internals.recordPtyWorktree('pty-db', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'db-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+    runtime.preAllocateHandleForPty('pty-db')
+
+    const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(candidate).toMatchObject({
+      hasOrchestrationOwnership: null,
+      isActiveCoordinatorHandle: null,
+      hasPendingOrDispatchedContext: null
+    })
+    runtime.dispose()
+  })
+
+  it('does not treat a reconstructed connected record as verified provider liveness', async () => {
+    const runtime = new OrcaRuntimeService(makeStore(true) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh')
+    })
+    const pty = internals.recordPtyWorktree('pty-restarted', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'restarted-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(candidate).toMatchObject({
+      providerConnected: null,
+      hasStartupCommand: null,
+      hasLaunchConfig: null,
+      hasLaunchAgent: null,
+      hasForegroundAgent: null,
+      agentStatus: null
+    })
+    runtime.dispose()
+  })
+
+  it('re-reads the provider incarnation after inspection before evaluating the candidate', async () => {
+    let resolveInspection!: (value: {
+      foregroundProcess: string
+      hasChildProcesses: boolean
+    }) => void
+    const runtime = new OrcaRuntimeService(makeStore(true) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    const inspectProcess = vi.fn(
+      () =>
+        new Promise<{ foregroundProcess: string; hasChildProcesses: boolean }>((resolve) => {
+          resolveInspection = resolve
+        })
+    )
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess
+    })
+    const pty = internals.recordPtyWorktree('pty-replaced', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'old-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    const pendingCandidate = internals.collectIdleEmptyTerminalReclaimCandidates()
+    await vi.waitFor(() => expect(inspectProcess).toHaveBeenCalledOnce())
+    pty.incarnationId = 'replacement-incarnation'
+    resolveInspection({ foregroundProcess: 'zsh', hasChildProcesses: false })
+    const [candidate] = await pendingCandidate
+
+    expect(candidate).toMatchObject({
+      expectedIncarnationId: 'old-incarnation',
+      incarnationId: 'replacement-incarnation',
+      providerConnected: null
+    })
+    expect(
+      evaluateIdleReclaimCandidate(
+        withOnlyLiveActivityFact(candidate!),
+        { enabled: true },
+        60 * 60 * 1000
+      )
+    ).toEqual({ eligible: false, reason: 'provider-unavailable-or-incarnation-stale' })
+    runtime.dispose()
+  })
+
+  it('reports an in-flight worktree terminal mutation instead of assuming false', async () => {
+    const runtime = new OrcaRuntimeService(makeStore(true) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    const mutationInternals = internals as unknown as {
+      terminalMutationTailByWorktreeId: Map<string, Promise<void>>
+    }
+    mutationInternals.terminalMutationTailByWorktreeId.set(WORKTREE_ID, Promise.resolve())
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
+    })
+    const pty = internals.recordPtyWorktree('pty-mutating', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'mutation-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(candidate?.hasInFlightTransaction).toBe(true)
     runtime.dispose()
   })
 
