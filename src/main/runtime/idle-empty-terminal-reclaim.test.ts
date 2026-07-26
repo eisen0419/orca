@@ -65,129 +65,394 @@ function candidate(
   }
 }
 
-type GuardCase = {
-  guard: number
-  reason: IdleEmptyTerminalReclaimRefusalReason
+type EvaluationInput = {
   candidateOverrides?: Partial<IdleEmptyTerminalReclaimCandidate>
   configOverrides?: Partial<IdleEmptyTerminalReclaimConfig>
+  now?: number
 }
 
-const GUARD_CASES: GuardCase[] = [
-  { guard: 1, reason: 'feature-disabled', configOverrides: { enabled: false } },
-  { guard: 2, reason: 'origin-not-eligible', candidateOverrides: { origin: 'user' } },
+function evaluate(input: EvaluationInput = {}) {
+  return evaluateIdleReclaimCandidate(
+    candidate(input.candidateOverrides),
+    { ...CONFIG, ...input.configOverrides },
+    input.now ?? NOW
+  )
+}
+
+type GuardPredicateCase = {
+  guard: number
+  predicate: string
+  reason: IdleEmptyTerminalReclaimRefusalReason
+  unsafe: EvaluationInput
+  unknown: EvaluationInput
+  safe?: EvaluationInput
+}
+
+const GUARD_PREDICATE_CASES: GuardPredicateCase[] = [
+  {
+    guard: 1,
+    predicate: 'feature enabled',
+    reason: 'feature-disabled',
+    unsafe: { configOverrides: { enabled: false } },
+    unknown: { configOverrides: { enabled: undefined } }
+  },
+  {
+    guard: 2,
+    predicate: 'eligible origin',
+    reason: 'origin-not-eligible',
+    unsafe: { candidateOverrides: { origin: 'user' } },
+    unknown: { candidateOverrides: { origin: undefined } },
+    safe: { candidateOverrides: { origin: 'orchestration' } }
+  },
   {
     guard: 3,
+    predicate: 'tab id',
     reason: 'topology-or-binding-invalid',
-    candidateOverrides: { hasExactTabLeafPtyWorktreeBinding: false }
+    unsafe: { candidateOverrides: { tabId: '' } },
+    unknown: { candidateOverrides: { tabId: null } },
+    safe: { candidateOverrides: { tabId: 'tab-2' } }
   },
-  { guard: 4, reason: 'protected-terminal-state', candidateOverrides: { isPinned: true } },
-  { guard: 5, reason: 'terminal-used-or-has-launch-work', candidateOverrides: { used: true } },
+  {
+    guard: 3,
+    predicate: 'leaf id',
+    reason: 'topology-or-binding-invalid',
+    unsafe: { candidateOverrides: { leafId: '' } },
+    unknown: { candidateOverrides: { leafId: null } },
+    safe: { candidateOverrides: { leafId: 'leaf-2' } }
+  },
+  {
+    guard: 3,
+    predicate: 'pty id',
+    reason: 'topology-or-binding-invalid',
+    unsafe: { candidateOverrides: { ptyId: '' } },
+    unknown: { candidateOverrides: { ptyId: null } },
+    safe: { candidateOverrides: { ptyId: 'pty-2' } }
+  },
+  {
+    guard: 3,
+    predicate: 'worktree id',
+    reason: 'topology-or-binding-invalid',
+    unsafe: { candidateOverrides: { worktreeId: '' } },
+    unknown: { candidateOverrides: { worktreeId: null } },
+    safe: { candidateOverrides: { worktreeId: 'worktree-2' } }
+  },
+  {
+    guard: 3,
+    predicate: 'single pane topology',
+    reason: 'topology-or-binding-invalid',
+    unsafe: { candidateOverrides: { isSinglePane: false } },
+    unknown: { candidateOverrides: { isSinglePane: null } }
+  },
+  {
+    guard: 3,
+    predicate: 'exact tab leaf pty worktree binding',
+    reason: 'topology-or-binding-invalid',
+    unsafe: { candidateOverrides: { hasExactTabLeafPtyWorktreeBinding: false } },
+    unknown: { candidateOverrides: { hasExactTabLeafPtyWorktreeBinding: null } }
+  },
+  {
+    guard: 3,
+    predicate: 'unshared pty',
+    reason: 'topology-or-binding-invalid',
+    unsafe: { candidateOverrides: { hasSharedPty: true } },
+    unknown: { candidateOverrides: { hasSharedPty: null } }
+  },
+  {
+    guard: 3,
+    predicate: 'consistent close ownership',
+    reason: 'topology-or-binding-invalid',
+    unsafe: {
+      candidateOverrides: { isPersisted: false, rendererOwnsPersistedTab: true }
+    },
+    unknown: { candidateOverrides: { isPersisted: null } }
+  },
+  {
+    guard: 4,
+    predicate: 'unpinned tab',
+    reason: 'protected-terminal-state',
+    unsafe: { candidateOverrides: { isPinned: true } },
+    unknown: { candidateOverrides: { isPinned: null } }
+  },
+  {
+    guard: 4,
+    predicate: 'non sleeping terminal',
+    reason: 'protected-terminal-state',
+    unsafe: { candidateOverrides: { isSleepingOrHibernating: true } },
+    unknown: { candidateOverrides: { isSleepingOrHibernating: null } }
+  },
+  {
+    guard: 4,
+    predicate: 'no pending restore or reconnect',
+    reason: 'protected-terminal-state',
+    unsafe: { candidateOverrides: { hasPendingRestoreOrReconnect: true } },
+    unknown: { candidateOverrides: { hasPendingRestoreOrReconnect: null } }
+  },
+  {
+    guard: 5,
+    predicate: 'never used terminal',
+    reason: 'terminal-used-or-has-launch-work',
+    unsafe: { candidateOverrides: { used: true } },
+    unknown: { candidateOverrides: { used: undefined } }
+  },
+  {
+    guard: 5,
+    predicate: 'no startup command',
+    reason: 'terminal-used-or-has-launch-work',
+    unsafe: { candidateOverrides: { hasStartupCommand: true } },
+    unknown: { candidateOverrides: { hasStartupCommand: null } }
+  },
+  {
+    guard: 5,
+    predicate: 'no launch config',
+    reason: 'terminal-used-or-has-launch-work',
+    unsafe: { candidateOverrides: { hasLaunchConfig: true } },
+    unknown: { candidateOverrides: { hasLaunchConfig: null } }
+  },
+  {
+    guard: 5,
+    predicate: 'no resume provider session',
+    reason: 'terminal-used-or-has-launch-work',
+    unsafe: { candidateOverrides: { hasResumeProviderSession: true } },
+    unknown: { candidateOverrides: { hasResumeProviderSession: null } }
+  },
+  {
+    guard: 5,
+    predicate: 'no launch agent',
+    reason: 'terminal-used-or-has-launch-work',
+    unsafe: { candidateOverrides: { hasLaunchAgent: true } },
+    unknown: { candidateOverrides: { hasLaunchAgent: null } }
+  },
   {
     guard: 6,
+    predicate: 'no foreground agent',
     reason: 'agent-or-orchestration-owned',
-    candidateOverrides: { hasForegroundAgent: true }
+    unsafe: { candidateOverrides: { hasForegroundAgent: true } },
+    unknown: { candidateOverrides: { hasForegroundAgent: null } }
+  },
+  {
+    guard: 6,
+    predicate: 'no agent status',
+    reason: 'agent-or-orchestration-owned',
+    unsafe: { candidateOverrides: { agentStatus: 'working' } },
+    unknown: { candidateOverrides: { agentStatus: null } }
+  },
+  {
+    guard: 6,
+    predicate: 'no provider session',
+    reason: 'agent-or-orchestration-owned',
+    unsafe: { candidateOverrides: { hasProviderSession: true } },
+    unknown: { candidateOverrides: { hasProviderSession: null } }
+  },
+  {
+    guard: 6,
+    predicate: 'no orchestration ownership',
+    reason: 'agent-or-orchestration-owned',
+    unsafe: { candidateOverrides: { hasOrchestrationOwnership: true } },
+    unknown: { candidateOverrides: { hasOrchestrationOwnership: null } }
   },
   {
     guard: 7,
+    predicate: 'finite current time',
     reason: 'not-idle-or-activity-stale',
-    candidateOverrides: { expectedActivityGeneration: 5 }
+    unsafe: { now: Number.NEGATIVE_INFINITY },
+    unknown: { now: Number.NaN }
+  },
+  {
+    guard: 7,
+    predicate: 'idle duration',
+    reason: 'not-idle-or-activity-stale',
+    unsafe: { candidateOverrides: { lastActivityAt: NOW } },
+    unknown: { candidateOverrides: { lastActivityAt: null } }
+  },
+  {
+    guard: 7,
+    predicate: 'finite last activity time',
+    reason: 'not-idle-or-activity-stale',
+    unsafe: { candidateOverrides: { lastActivityAt: Number.NaN } },
+    unknown: { candidateOverrides: { lastActivityAt: null } }
+  },
+  {
+    guard: 7,
+    predicate: 'integer activity generation',
+    reason: 'not-idle-or-activity-stale',
+    unsafe: {
+      candidateOverrides: { activityGeneration: 4.5, expectedActivityGeneration: 4.5 }
+    },
+    unknown: { candidateOverrides: { activityGeneration: null } }
+  },
+  {
+    guard: 7,
+    predicate: 'exact activity generation',
+    reason: 'not-idle-or-activity-stale',
+    unsafe: { candidateOverrides: { expectedActivityGeneration: 5 } },
+    unknown: { candidateOverrides: { expectedActivityGeneration: null } }
   },
   {
     guard: 8,
+    predicate: 'connected provider',
     reason: 'provider-unavailable-or-incarnation-stale',
-    candidateOverrides: { expectedIncarnationId: 'incarnation-2' }
+    unsafe: { candidateOverrides: { providerConnected: false } },
+    unknown: { candidateOverrides: { providerConnected: null } }
+  },
+  {
+    guard: 8,
+    predicate: 'writable provider',
+    reason: 'provider-unavailable-or-incarnation-stale',
+    unsafe: { candidateOverrides: { providerWritable: false } },
+    unknown: { candidateOverrides: { providerWritable: null } }
+  },
+  {
+    guard: 8,
+    predicate: 'nonempty incarnation id',
+    reason: 'provider-unavailable-or-incarnation-stale',
+    unsafe: { candidateOverrides: { incarnationId: '', expectedIncarnationId: '' } },
+    unknown: { candidateOverrides: { incarnationId: null, expectedIncarnationId: null } }
+  },
+  {
+    guard: 8,
+    predicate: 'exact incarnation id',
+    reason: 'provider-unavailable-or-incarnation-stale',
+    unsafe: { candidateOverrides: { expectedIncarnationId: 'incarnation-2' } },
+    unknown: { candidateOverrides: { expectedIncarnationId: null } }
   },
   {
     guard: 9,
+    predicate: 'inspection result',
     reason: 'foreground-process-not-empty-shell',
-    candidateOverrides: {
-      inspection: { status: 'success', foregroundProcess: 'wrapper', hasChildProcesses: false }
+    unsafe: {
+      candidateOverrides: {
+        inspection: { status: 'error', foregroundProcess: 'shell', hasChildProcesses: false }
+      }
+    },
+    unknown: { candidateOverrides: { inspection: null } }
+  },
+  {
+    guard: 9,
+    predicate: 'successful inspection',
+    reason: 'foreground-process-not-empty-shell',
+    unsafe: {
+      candidateOverrides: {
+        inspection: { status: 'error', foregroundProcess: 'shell', hasChildProcesses: false }
+      }
+    },
+    unknown: {
+      candidateOverrides: {
+        inspection: { status: null, foregroundProcess: 'shell', hasChildProcesses: false }
+      }
     }
   },
-  { guard: 10, reason: 'renderer-visible', candidateOverrides: { rendererVisibility: 'visible' } },
+  {
+    guard: 9,
+    predicate: 'shell foreground process',
+    reason: 'foreground-process-not-empty-shell',
+    unsafe: {
+      candidateOverrides: {
+        inspection: { status: 'success', foregroundProcess: 'wrapper', hasChildProcesses: false }
+      }
+    },
+    unknown: {
+      candidateOverrides: {
+        inspection: { status: 'success', foregroundProcess: null, hasChildProcesses: false }
+      }
+    }
+  },
+  {
+    guard: 9,
+    predicate: 'no shell child processes',
+    reason: 'foreground-process-not-empty-shell',
+    unsafe: {
+      candidateOverrides: {
+        inspection: { status: 'success', foregroundProcess: 'shell', hasChildProcesses: true }
+      }
+    },
+    unknown: {
+      candidateOverrides: {
+        inspection: { status: 'success', foregroundProcess: 'shell', hasChildProcesses: null }
+      }
+    }
+  },
+  {
+    guard: 10,
+    predicate: 'hidden renderer tab',
+    reason: 'renderer-visible',
+    unsafe: { candidateOverrides: { rendererVisibility: 'visible' } },
+    unknown: { candidateOverrides: { rendererVisibility: null } }
+  },
   {
     guard: 11,
+    predicate: 'no mobile driver',
     reason: 'mobile-or-remote-viewer-attached',
-    candidateOverrides: { hasMobileDriver: true }
+    unsafe: { candidateOverrides: { hasMobileDriver: true } },
+    unknown: { candidateOverrides: { hasMobileDriver: null } }
+  },
+  {
+    guard: 11,
+    predicate: 'no mobile subscriber',
+    reason: 'mobile-or-remote-viewer-attached',
+    unsafe: { candidateOverrides: { hasMobileSubscriber: true } },
+    unknown: { candidateOverrides: { hasMobileSubscriber: null } }
+  },
+  {
+    guard: 11,
+    predicate: 'no remote desktop viewer',
+    reason: 'mobile-or-remote-viewer-attached',
+    unsafe: { candidateOverrides: { hasRemoteDesktopViewer: true } },
+    unknown: { candidateOverrides: { hasRemoteDesktopViewer: null } }
   },
   {
     guard: 12,
+    predicate: 'inactive coordinator handle',
     reason: 'active-coordinator-or-dispatch',
-    candidateOverrides: { isActiveCoordinatorHandle: true }
+    unsafe: { candidateOverrides: { isActiveCoordinatorHandle: true } },
+    unknown: { candidateOverrides: { isActiveCoordinatorHandle: null } }
+  },
+  {
+    guard: 12,
+    predicate: 'no pending or dispatched context',
+    reason: 'active-coordinator-or-dispatch',
+    unsafe: { candidateOverrides: { hasPendingOrDispatchedContext: true } },
+    unknown: { candidateOverrides: { hasPendingOrDispatchedContext: null } }
   },
   {
     guard: 13,
+    predicate: 'no in flight terminal transaction',
     reason: 'terminal-transaction-in-flight',
-    candidateOverrides: { hasInFlightTransaction: true }
+    unsafe: { candidateOverrides: { hasInFlightTransaction: true } },
+    unknown: { candidateOverrides: { hasInFlightTransaction: null } }
   },
   {
     guard: 14,
+    predicate: 'second confirmation',
     reason: 'final-confirmation-or-claim-missing',
-    candidateOverrides: { hasSecondConfirmation: false }
-  }
-]
-
-const FAIL_CLOSED_CASES: {
-  name: string
-  overrides: Partial<IdleEmptyTerminalReclaimCandidate>
-  reason: IdleEmptyTerminalReclaimRefusalReason
-}[] = [
-  {
-    name: 'missing origin',
-    overrides: { origin: undefined },
-    reason: 'origin-not-eligible'
+    unsafe: { candidateOverrides: { hasSecondConfirmation: false } },
+    unknown: { candidateOverrides: { hasSecondConfirmation: null } }
   },
   {
-    name: 'legacy origin',
-    overrides: { origin: 'legacy' },
-    reason: 'origin-not-eligible'
-  },
-  {
-    name: 'unknown used fact',
-    overrides: { used: undefined },
-    reason: 'terminal-used-or-has-launch-work'
-  },
-  {
-    name: 'inspection error',
-    overrides: {
-      inspection: { status: 'error', foregroundProcess: null, hasChildProcesses: null }
-    },
-    reason: 'foreground-process-not-empty-shell'
-  },
-  {
-    name: 'missing inspection',
-    overrides: { inspection: null },
-    reason: 'foreground-process-not-empty-shell'
-  },
-  {
-    name: 'shell child process',
-    overrides: {
-      inspection: { status: 'success', foregroundProcess: 'shell', hasChildProcesses: true }
-    },
-    reason: 'foreground-process-not-empty-shell'
+    guard: 14,
+    predicate: 'exact identity claim',
+    reason: 'final-confirmation-or-claim-missing',
+    unsafe: { candidateOverrides: { hasExactIdentityClaim: false } },
+    unknown: { candidateOverrides: { hasExactIdentityClaim: null } }
   }
 ]
 
 describe('evaluateIdleReclaimCandidate', () => {
-  it.each(GUARD_CASES)('refuses guard $guard with $reason', (guardCase) => {
-    expect(
-      evaluateIdleReclaimCandidate(
-        candidate(guardCase.candidateOverrides),
-        { ...CONFIG, ...guardCase.configOverrides },
-        NOW
-      )
-    ).toMatchObject({ eligible: false, reason: guardCase.reason })
-  })
+  it.each(GUARD_PREDICATE_CASES)(
+    'refuses unsafe guard $guard predicate: $predicate',
+    ({ reason, unsafe }) => {
+      expect(evaluate(unsafe)).toEqual({ eligible: false, reason })
+    }
+  )
 
-  it.each(GUARD_CASES)('allows a candidate when guard $guard is satisfied', () => {
-    expect(evaluateIdleReclaimCandidate(candidate(), CONFIG, NOW)).toEqual({
-      eligible: true,
-      closeMode: 'renderer-owned-persisted'
-    })
-  })
+  it.each(GUARD_PREDICATE_CASES)(
+    'refuses unknown guard $guard predicate: $predicate',
+    ({ reason, unknown }) => {
+      expect(evaluate(unknown)).toEqual({ eligible: false, reason })
+    }
+  )
 
-  it('allows a candidate only after all 14 guards pass', () => {
-    expect(evaluateIdleReclaimCandidate(candidate(), CONFIG, NOW)).toEqual({
+  it.each(GUARD_PREDICATE_CASES)('allows safe guard $guard predicate: $predicate', ({ safe }) => {
+    expect(evaluate(safe)).toEqual({
       eligible: true,
       closeMode: 'renderer-owned-persisted'
     })
@@ -202,45 +467,43 @@ describe('evaluateIdleReclaimCandidate', () => {
       mode: 'runtime-owned-persisted',
       overrides: { isPersisted: true, rendererOwnsPersistedTab: false }
     },
-    { mode: 'hot-only', overrides: { isPersisted: false, rendererOwnsPersistedTab: null } }
+    { mode: 'hot-only', overrides: { isPersisted: false, rendererOwnsPersistedTab: false } }
   ])('classifies $mode candidates', ({ mode, overrides }) => {
-    expect(evaluateIdleReclaimCandidate(candidate(overrides), CONFIG, NOW)).toEqual({
-      eligible: true,
-      closeMode: mode
-    })
+    expect(evaluate({ candidateOverrides: overrides })).toEqual({ eligible: true, closeMode: mode })
   })
 
-  it.each(FAIL_CLOSED_CASES)('fails closed for $name', ({ overrides, reason }) => {
-    expect(evaluateIdleReclaimCandidate(candidate(overrides), CONFIG, NOW)).toMatchObject({
+  it.each([
+    {
+      name: 'contradictory persistence and renderer ownership',
+      overrides: { isPersisted: false, rendererOwnsPersistedTab: true }
+    },
+    { name: 'unknown persistence', overrides: { isPersisted: null } },
+    { name: 'unknown renderer ownership', overrides: { rendererOwnsPersistedTab: null } },
+    {
+      name: 'unknown renderer ownership for a hot-only tab',
+      overrides: { isPersisted: false, rendererOwnsPersistedTab: null }
+    }
+  ])('refuses $name', ({ overrides }) => {
+    expect(evaluate({ candidateOverrides: overrides })).toEqual({
       eligible: false,
-      reason
+      reason: 'topology-or-binding-invalid'
     })
   })
 
-  it('refuses a stale activity generation even when the terminal is old enough', () => {
-    expect(
-      evaluateIdleReclaimCandidate(candidate({ expectedActivityGeneration: 5 }), CONFIG, NOW)
-    ).toMatchObject({ eligible: false, reason: 'not-idle-or-activity-stale' })
-  })
+  it('omits closeMode from refused evaluations', () => {
+    const evaluation = evaluate({ candidateOverrides: { isPinned: true } })
 
-  it('refuses a stale incarnation even when all process facts remain safe', () => {
-    expect(
-      evaluateIdleReclaimCandidate(
-        candidate({ expectedIncarnationId: 'new-incarnation' }),
-        CONFIG,
-        NOW
-      )
-    ).toMatchObject({ eligible: false, reason: 'provider-unavailable-or-incarnation-stale' })
+    expect(evaluation).toEqual({ eligible: false, reason: 'protected-terminal-state' })
+    expect('closeMode' in evaluation).toBe(false)
   })
 
   it('normalizes the reclaim threshold before checking idle time', () => {
     const normalizedMinimum = 5 * 60 * 1000
     expect(
-      evaluateIdleReclaimCandidate(
-        candidate({ lastActivityAt: NOW - normalizedMinimum }),
-        { enabled: true, idleThresholdMs: 0 },
-        NOW
-      )
+      evaluate({
+        candidateOverrides: { lastActivityAt: NOW - normalizedMinimum },
+        configOverrides: { idleThresholdMs: 0 }
+      })
     ).toMatchObject({ eligible: true })
   })
 })

@@ -26,7 +26,7 @@ export type IdleEmptyTerminalReclaimRefusalReason =
   | 'final-confirmation-or-claim-missing'
 
 export type IdleEmptyTerminalReclaimInspection = {
-  status: 'success' | 'error'
+  status: 'success' | 'error' | null
   foregroundProcess: 'shell' | 'wrapper' | 'other' | null
   hasChildProcesses: boolean | null
 } | null
@@ -85,7 +85,6 @@ export type IdleEmptyTerminalReclaimEvaluation =
     }
   | {
       eligible: false
-      closeMode: IdleEmptyTerminalReclaimCloseMode | null
       reason: IdleEmptyTerminalReclaimRefusalReason
     }
 
@@ -96,7 +95,7 @@ function isNonEmptyString(value: string | null): value is string {
 function classifyCloseMode(
   candidate: IdleEmptyTerminalReclaimCandidate
 ): IdleEmptyTerminalReclaimCloseMode | null {
-  if (candidate.isPersisted === false) {
+  if (candidate.isPersisted === false && candidate.rendererOwnsPersistedTab === false) {
     return 'hot-only'
   }
   if (candidate.isPersisted !== true) {
@@ -112,10 +111,9 @@ function classifyCloseMode(
 }
 
 function refused(
-  reason: IdleEmptyTerminalReclaimRefusalReason,
-  closeMode: IdleEmptyTerminalReclaimCloseMode | null
+  reason: IdleEmptyTerminalReclaimRefusalReason
 ): IdleEmptyTerminalReclaimEvaluation {
-  return { eligible: false, closeMode, reason }
+  return { eligible: false, reason }
 }
 
 export function evaluateIdleReclaimCandidate(
@@ -127,12 +125,12 @@ export function evaluateIdleReclaimCandidate(
   const idleThresholdMs = normalizeTerminalIdleEmptyReclaimMs(config.idleThresholdMs)
 
   if (config.enabled !== true) {
-    return refused('feature-disabled', closeMode)
+    return refused('feature-disabled')
   }
 
   const origin = normalizeTerminalCreationOrigin(candidate.origin)
   if (origin !== 'cli' && origin !== 'orchestration') {
-    return refused('origin-not-eligible', closeMode)
+    return refused('origin-not-eligible')
   }
 
   if (
@@ -145,7 +143,7 @@ export function evaluateIdleReclaimCandidate(
     candidate.hasSharedPty !== false ||
     closeMode === null
   ) {
-    return refused('topology-or-binding-invalid', closeMode)
+    return refused('topology-or-binding-invalid')
   }
 
   if (
@@ -153,7 +151,7 @@ export function evaluateIdleReclaimCandidate(
     candidate.isSleepingOrHibernating !== false ||
     candidate.hasPendingRestoreOrReconnect !== false
   ) {
-    return refused('protected-terminal-state', closeMode)
+    return refused('protected-terminal-state')
   }
 
   if (
@@ -167,7 +165,7 @@ export function evaluateIdleReclaimCandidate(
     candidate.hasResumeProviderSession !== false ||
     candidate.hasLaunchAgent !== false
   ) {
-    return refused('terminal-used-or-has-launch-work', closeMode)
+    return refused('terminal-used-or-has-launch-work')
   }
 
   if (
@@ -176,7 +174,7 @@ export function evaluateIdleReclaimCandidate(
     candidate.hasProviderSession !== false ||
     candidate.hasOrchestrationOwnership !== false
   ) {
-    return refused('agent-or-orchestration-owned', closeMode)
+    return refused('agent-or-orchestration-owned')
   }
 
   if (
@@ -189,7 +187,7 @@ export function evaluateIdleReclaimCandidate(
     typeof candidate.expectedActivityGeneration !== 'number' ||
     candidate.activityGeneration !== candidate.expectedActivityGeneration
   ) {
-    return refused('not-idle-or-activity-stale', closeMode)
+    return refused('not-idle-or-activity-stale')
   }
 
   if (
@@ -198,7 +196,7 @@ export function evaluateIdleReclaimCandidate(
     !isNonEmptyString(candidate.incarnationId) ||
     candidate.incarnationId !== candidate.expectedIncarnationId
   ) {
-    return refused('provider-unavailable-or-incarnation-stale', closeMode)
+    return refused('provider-unavailable-or-incarnation-stale')
   }
 
   const inspection = candidate.inspection
@@ -208,11 +206,11 @@ export function evaluateIdleReclaimCandidate(
     inspection.foregroundProcess !== 'shell' ||
     inspection.hasChildProcesses !== false
   ) {
-    return refused('foreground-process-not-empty-shell', closeMode)
+    return refused('foreground-process-not-empty-shell')
   }
 
   if (candidate.rendererVisibility !== 'hidden') {
-    return refused('renderer-visible', closeMode)
+    return refused('renderer-visible')
   }
 
   if (
@@ -220,22 +218,22 @@ export function evaluateIdleReclaimCandidate(
     candidate.hasMobileSubscriber !== false ||
     candidate.hasRemoteDesktopViewer !== false
   ) {
-    return refused('mobile-or-remote-viewer-attached', closeMode)
+    return refused('mobile-or-remote-viewer-attached')
   }
 
   if (
     candidate.isActiveCoordinatorHandle !== false ||
     candidate.hasPendingOrDispatchedContext !== false
   ) {
-    return refused('active-coordinator-or-dispatch', closeMode)
+    return refused('active-coordinator-or-dispatch')
   }
 
   if (candidate.hasInFlightTransaction !== false) {
-    return refused('terminal-transaction-in-flight', closeMode)
+    return refused('terminal-transaction-in-flight')
   }
 
   if (candidate.hasSecondConfirmation !== true || candidate.hasExactIdentityClaim !== true) {
-    return refused('final-confirmation-or-claim-missing', closeMode)
+    return refused('final-confirmation-or-claim-missing')
   }
 
   return { eligible: true, closeMode }

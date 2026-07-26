@@ -80,6 +80,34 @@ describe('IdleEmptyTerminalReclaimScheduler', () => {
     scheduler.dispose()
   })
 
+  it('resets retry backoff after a successful tick', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const tick = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error('first failure'))
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('second failure'))
+    const scheduler = new IdleEmptyTerminalReclaimScheduler(tick)
+
+    scheduler.start()
+    await vi.advanceTimersByTimeAsync(IDLE_EMPTY_TERMINAL_RECLAIM_SCAN_INTERVAL_MS)
+    expect(tick).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(tick).toHaveBeenCalledTimes(2)
+
+    await vi.advanceTimersByTimeAsync(IDLE_EMPTY_TERMINAL_RECLAIM_SCAN_INTERVAL_MS)
+    expect(tick).toHaveBeenCalledTimes(3)
+
+    await vi.advanceTimersByTimeAsync(999)
+    expect(tick).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(tick).toHaveBeenCalledTimes(4)
+
+    scheduler.dispose()
+  })
+
   it('unrefs injected timers and honors reset scheduling from the injected clock', async () => {
     const unref = vi.fn()
     const cancel = vi.fn()
