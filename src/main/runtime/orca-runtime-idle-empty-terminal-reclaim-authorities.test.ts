@@ -756,7 +756,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
     runtime.dispose()
   })
 
-  it('stops snapshot collection when its cooperative budget is exhausted', async () => {
+  it('admits one snapshot when its cooperative budget is exhausted', async () => {
     const runtime = new OrcaRuntimeService(makeStore(true) as never)
     const internals = runtime as unknown as RuntimeIdleReclaimInternals
     const inspectProcess = vi.fn(async () => ({
@@ -781,10 +781,10 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
 
     await internals.tickIdleEmptyTerminalReclaim()
 
-    expect(inspectProcess).not.toHaveBeenCalled()
+    expect(inspectProcess).toHaveBeenCalledOnce()
     expect(debug).toHaveBeenCalledWith(
       '[idle-empty-terminal-reclaim] tick decisions',
-      expect.objectContaining({ candidateCount: 0, truncatedCandidateCount: 1 })
+      expect.objectContaining({ candidateCount: 1, truncatedCandidateCount: 0 })
     )
     runtime.dispose()
   })

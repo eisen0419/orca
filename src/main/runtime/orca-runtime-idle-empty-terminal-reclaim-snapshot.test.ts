@@ -33,6 +33,8 @@ type RuntimeIdleReclaimInternals = {
   dropDisconnectedPtyRecord: (ptyId: string) => void
 }
 
+type RuntimeIdleReclaimPty = ReturnType<RuntimeIdleReclaimInternals['recordPtyWorktree']>
+
 function makeStore(session: WorkspaceSessionState | null = null) {
   return {
     getSettings: () => ({
@@ -77,20 +79,35 @@ function configurePtyController(
   })
 }
 
+function collectSnapshotCandidate(
+  internals: RuntimeIdleReclaimInternals,
+  pty: RuntimeIdleReclaimPty
+): IdleEmptyTerminalReclaimCandidate {
+  const snapshotInternals = internals as unknown as {
+    collectIdleEmptyTerminalReclaimTickSnapshot: (
+      ptys: readonly RuntimeIdleReclaimPty[],
+      deadline: number
+    ) => unknown
+    collectIdleEmptyTerminalReclaimCandidateSnapshot: (
+      snapshotPty: RuntimeIdleReclaimPty,
+      tick: unknown
+    ) => IdleEmptyTerminalReclaimCandidate
+  }
+  const tick = snapshotInternals.collectIdleEmptyTerminalReclaimTickSnapshot([pty], 50)
+  return snapshotInternals.collectIdleEmptyTerminalReclaimCandidateSnapshot(pty, tick)
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
 })
 
 describe('OrcaRuntimeService idle empty-terminal reclaim snapshots', () => {
-  it('rotates the selection after an exhausted snapshot admits no candidates', async () => {
+  it('eventually inspects every deferred PTY during sustained snapshot exhaustion', async () => {
     let now = 0
-    let snapshotExhausted = true
     const runtime = new OrcaRuntimeService({
       ...makeStore(),
       getWorkspaceSession: () => {
-        if (snapshotExhausted) {
-          now = SNAPSHOT_BUDGET_MS
-        }
+        now = SNAPSHOT_BUDGET_MS
         return null
       }
     } as never)
@@ -100,7 +117,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim snapshots', () => {
       hasChildProcesses: false
     }))
     configurePtyController(runtime, inspectProcess)
-    for (let index = 0; index < 65; index += 1) {
+    for (let index = 0; index < 3; index += 1) {
       internals.recordPtyWorktree(`pty-exhausted-${index}`, WORKTREE_ID, {
         connected: true,
         incarnationId: `exhausted-incarnation-${index}`,
@@ -113,14 +130,14 @@ describe('OrcaRuntimeService idle empty-terminal reclaim snapshots', () => {
     await internals.tickIdleEmptyTerminalReclaim()
     now = 0
     await internals.tickIdleEmptyTerminalReclaim()
-    expect(inspectProcess).not.toHaveBeenCalled()
-    snapshotExhausted = false
     now = 0
     await internals.tickIdleEmptyTerminalReclaim()
 
-    expect(inspectProcess).toHaveBeenCalledTimes(64)
-    expect(inspectProcess.mock.calls[0]?.[0]).toBe('pty-exhausted-63')
-    expect(inspectProcess.mock.calls[63]?.[0]).toBe('pty-exhausted-61')
+    expect(inspectProcess.mock.calls.map(([ptyId]) => ptyId)).toEqual([
+      'pty-exhausted-0',
+      'pty-exhausted-1',
+      'pty-exhausted-2'
+    ])
     runtime.dispose()
   })
 
@@ -283,6 +300,185 @@ describe('OrcaRuntimeService idle empty-terminal reclaim snapshots', () => {
 
     expect(agentSnapshot).not.toHaveBeenCalled()
     expect(candidate).toMatchObject({ isPersisted: false, hasSharedPty: null, agentStatus: null })
+    runtime.dispose()
+  })
+
+  it('stops a large agent-hook snapshot before orchestration and preserves nulls', () => {
+    let now = 0
+    const getActiveDispatchAssignees = vi.fn(() => [])
+    const getActiveCoordinatorRun = vi.fn(() => undefined)
+    const runtime = new OrcaRuntimeService(
+      makeStore(getDefaultWorkspaceSession()) as never,
+      undefined,
+      {
+        getAgentStatusSnapshot: (() => {
+          const statuses = Array.from({ length: 64 }, (_, index) => ({
+            paneKey: index === 0 ? `${HOT_TAB_ID}:${HOT_LEAF_ID}` : `agent-pane-${index}`,
+            state: 'none' as const
+          }))
+          Object.defineProperty(statuses, Symbol.iterator, {
+            value: function* () {
+              for (const [index, status] of statuses.entries()) {
+                if (index === 61) {
+                  now = SNAPSHOT_BUDGET_MS
+                }
+                if (index === 62) {
+                  now = 0
+                }
+                yield status
+              }
+            }
+          })
+          return statuses
+        }) as never
+      }
+    )
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    runtime.setOrchestrationDb({ getActiveDispatchAssignees, getActiveCoordinatorRun } as never)
+    const pty = internals.recordPtyWorktree('pty-agent-hook-snapshot', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'agent-hook-snapshot',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+
+    const candidate = collectSnapshotCandidate(internals, pty)
+
+    expect(getActiveDispatchAssignees).not.toHaveBeenCalled()
+    expect(candidate).toMatchObject({ agentStatus: null, hasOrchestrationOwnership: null })
+    runtime.dispose()
+  })
+
+  it('stops a large handle-index snapshot before orchestration and preserves nulls', () => {
+    let now = 0
+    const getActiveDispatchAssignees = vi.fn(() => [])
+    const runtime = new OrcaRuntimeService(makeStore(getDefaultWorkspaceSession()) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    const handleInternals = internals as unknown as { handleByPtyId: Map<string, string> }
+    const handleEntries: [string, string][] = Array.from({ length: 64 }, (_, index) => [
+      index === 0 ? 'pty-handle-snapshot' : `pty-handle-${index}`,
+      `term-handle-${index}`
+    ])
+    const handlesByPtyId = new Map(handleEntries)
+    Object.defineProperty(handlesByPtyId, Symbol.iterator, {
+      value: function* () {
+        for (const [index, entry] of handleEntries.entries()) {
+          if (index === 61) {
+            now = SNAPSHOT_BUDGET_MS
+          }
+          if (index === 62) {
+            now = 0
+          }
+          yield entry
+        }
+      }
+    })
+    handleInternals.handleByPtyId = handlesByPtyId
+    runtime.setOrchestrationDb({
+      getActiveDispatchAssignees,
+      getActiveCoordinatorRun: vi.fn(() => undefined)
+    } as never)
+    const pty = internals.recordPtyWorktree('pty-handle-snapshot', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'handle-snapshot',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+
+    const candidate = collectSnapshotCandidate(internals, pty)
+
+    expect(getActiveDispatchAssignees).not.toHaveBeenCalled()
+    expect(candidate).toMatchObject({ hasOrchestrationOwnership: null })
+    runtime.dispose()
+  })
+
+  it('stops a large archive snapshot before orchestration and preserves nulls', () => {
+    let now = 0
+    const getActiveDispatchAssignees = vi.fn(() => [])
+    const runtime = new OrcaRuntimeService(makeStore(getDefaultWorkspaceSession()) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    const archiveInternals = internals as unknown as {
+      headlessTerminalArchiveByOperationId: Map<string, Promise<string>>
+    }
+    const operationIds = Array.from({ length: 64 }, (_, index) => `archive-operation-${index}`)
+    const archives = new Map(
+      operationIds.map((operationId) => [operationId, Promise.resolve('done')])
+    )
+    Object.defineProperty(archives, 'keys', {
+      value: function* () {
+        for (const [index, operationId] of operationIds.entries()) {
+          if (index === 61) {
+            now = SNAPSHOT_BUDGET_MS
+          }
+          if (index === 62) {
+            now = 0
+          }
+          yield operationId
+        }
+      }
+    })
+    archiveInternals.headlessTerminalArchiveByOperationId = archives
+    runtime.setOrchestrationDb({
+      getActiveDispatchAssignees,
+      getActiveCoordinatorRun: vi.fn(() => undefined)
+    } as never)
+    const pty = internals.recordPtyWorktree('pty-archive-snapshot', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'archive-snapshot',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+
+    const candidate = collectSnapshotCandidate(internals, pty)
+
+    expect(getActiveDispatchAssignees).not.toHaveBeenCalled()
+    expect(candidate).toMatchObject({ hasInFlightTransaction: null })
+    runtime.dispose()
+  })
+
+  it('stops a large orchestration snapshot before coordinator lookup and preserves nulls', () => {
+    let now = 0
+    const runtime = new OrcaRuntimeService(makeStore(getDefaultWorkspaceSession()) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    const handleInternals = internals as unknown as { handleByPtyId: Map<string, string> }
+    handleInternals.handleByPtyId.set('pty-orchestration-snapshot', 'term-orchestration')
+    const activeDispatches = Array.from({ length: 64 }, (_, index) => ({
+      assignee_handle: `dispatch-${index}`,
+      assignee_pane_key: null
+    }))
+    Object.defineProperty(activeDispatches, Symbol.iterator, {
+      value: function* () {
+        for (const [index, dispatch] of activeDispatches.entries()) {
+          if (index === 61) {
+            now = SNAPSHOT_BUDGET_MS
+          }
+          if (index === 62) {
+            now = 0
+          }
+          yield dispatch
+        }
+      }
+    })
+    const getActiveCoordinatorRun = vi.fn(() => undefined)
+    runtime.setOrchestrationDb({
+      getActiveDispatchAssignees: vi.fn(() => activeDispatches),
+      getActiveCoordinatorRun
+    } as never)
+    const pty = internals.recordPtyWorktree('pty-orchestration-snapshot', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'orchestration-snapshot',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+
+    const candidate = collectSnapshotCandidate(internals, pty)
+
+    expect(getActiveCoordinatorRun).not.toHaveBeenCalled()
+    expect(candidate).toMatchObject({ hasOrchestrationOwnership: null })
     runtime.dispose()
   })
 })

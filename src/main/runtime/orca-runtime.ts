@@ -2819,6 +2819,8 @@ export class OrcaRuntimeService {
   private idleEmptyTerminalReclaimTruncatedCandidateCount = 0
   // Why: resuming the Map iterator avoids re-scanning a deleted cursor before the budget starts.
   private idleEmptyTerminalReclaimCursor: Iterator<RuntimePtyWorktreeRecord> | null = null
+  // Why: retain unadmitted selections so sustained snapshot exhaustion still reaches every PTY.
+  private idleEmptyTerminalReclaimDeferredPtys: RuntimePtyWorktreeRecord[] = []
   // Why: ordinary OSC 0/1/2 titles can split across PTY chunks, especially over
   // SSH/relay buffering. Keep a small raw scan tail and feed reconstructed
   // chunks into the title tracker instead of falling back to last-title scans.
@@ -3219,44 +3221,76 @@ export class OrcaRuntimeService {
     if (ptyCount === 0) {
       this.idleEmptyTerminalReclaimTruncatedCandidateCount = 0
       this.idleEmptyTerminalReclaimCursor = null
+      this.idleEmptyTerminalReclaimDeferredPtys = []
       return []
     }
     const snapshotDeadline = Date.now() + IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
     const selectedPtys: RuntimePtyWorktreeRecord[] = []
     const selectionLimit = Math.min(IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK, ptyCount)
+    const deferredPtys = this.idleEmptyTerminalReclaimDeferredPtys.filter(
+      (pty) => this.ptysById.get(pty.ptyId) === pty
+    )
     while (
+      deferredPtys.length > 0 &&
       selectedPtys.length < selectionLimit &&
       (selectedPtys.length === 0 || Date.now() < snapshotDeadline)
     ) {
-      let next = this.idleEmptyTerminalReclaimCursor?.next()
-      if (!next || next.done) {
-        this.idleEmptyTerminalReclaimCursor = this.ptysById.values()
-        next = this.idleEmptyTerminalReclaimCursor.next()
+      const deferredPty = deferredPtys.shift()
+      if (deferredPty) {
+        selectedPtys.push(deferredPty)
       }
-      if (next.done) {
-        break
+    }
+    this.idleEmptyTerminalReclaimDeferredPtys = deferredPtys
+    if (selectedPtys.length === 0 && deferredPtys.length === 0) {
+      while (
+        selectedPtys.length < selectionLimit &&
+        (selectedPtys.length === 0 || Date.now() < snapshotDeadline)
+      ) {
+        let next = this.idleEmptyTerminalReclaimCursor?.next()
+        if (!next || next.done) {
+          this.idleEmptyTerminalReclaimCursor = this.ptysById.values()
+          next = this.idleEmptyTerminalReclaimCursor.next()
+        }
+        if (next.done) {
+          break
+        }
+        selectedPtys.push(next.value)
       }
-      selectedPtys.push(next.value)
     }
     const tick = this.collectIdleEmptyTerminalReclaimTickSnapshot(selectedPtys, snapshotDeadline)
     const snapshots: IdleEmptyTerminalReclaimCandidateSnapshot[] = []
     for (const pty of selectedPtys) {
-      if (Date.now() >= snapshotDeadline) {
+      if (snapshots.length > 0 && Date.now() >= snapshotDeadline) {
         break
       }
       snapshots.push(this.collectIdleEmptyTerminalReclaimCandidateSnapshot(pty, tick))
     }
+    this.idleEmptyTerminalReclaimDeferredPtys = [
+      ...selectedPtys.slice(snapshots.length),
+      ...this.idleEmptyTerminalReclaimDeferredPtys
+    ]
     this.idleEmptyTerminalReclaimTruncatedCandidateCount = ptyCount - snapshots.length
     const candidates = await collectIdleEmptyTerminalReclaimCandidates(
       snapshots,
       async (ptyId) => await this.inspectIdleEmptyTerminalReclaimPty(ptyId)
     )
+    const ownershipDeadline = Date.now() + IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
+    const sessionByWorktreeId = new Map<string, WorkspaceSessionState | null>()
+    const persistedBindingsBySession = new Map<
+      WorkspaceSessionState,
+      IdleEmptyTerminalReclaimPersistedBindingIndex
+    >()
     for (const candidate of candidates) {
       const livePty = candidate.ptyId ? this.ptysById.get(candidate.ptyId) : undefined
       candidate.incarnationId = livePty?.incarnationId ?? null
       candidate.activityGeneration = livePty?.activityGeneration ?? null
       const ownership = livePty
-        ? this.collectIdleEmptyTerminalReclaimLiveOwnershipFacts(livePty)
+        ? this.collectIdleEmptyTerminalReclaimLiveOwnershipFacts(
+            livePty,
+            ownershipDeadline,
+            sessionByWorktreeId,
+            persistedBindingsBySession
+          )
         : { isPersisted: null, rendererOwnsPersistedTab: null }
       candidate.isPersisted = ownership.isPersisted
       candidate.rendererOwnsPersistedTab = ownership.rendererOwnsPersistedTab
@@ -3277,14 +3311,45 @@ export class OrcaRuntimeService {
     return candidates
   }
 
-  private collectIdleEmptyTerminalReclaimLiveOwnershipFacts(pty: RuntimePtyWorktreeRecord) {
-    const deadline = Date.now() + IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
+  private collectIdleEmptyTerminalReclaimLiveOwnershipFacts(
+    pty: RuntimePtyWorktreeRecord,
+    deadline: number,
+    sessionByWorktreeId: Map<string, WorkspaceSessionState | null>,
+    persistedBindingsBySession: Map<
+      WorkspaceSessionState,
+      IdleEmptyTerminalReclaimPersistedBindingIndex
+    >
+  ) {
     const hasTimeRemaining = (): boolean => Date.now() < deadline
-    const session = hasTimeRemaining() ? this.getWorkspaceSessionForWorktree(pty.worktreeId) : null
-    const persistedBindingIndex =
-      session && hasTimeRemaining()
-        ? indexIdleEmptyTerminalReclaimPersistedBindings(session, hasTimeRemaining)
-        : null
+    if (!hasTimeRemaining()) {
+      return { isPersisted: null, rendererOwnsPersistedTab: null }
+    }
+    let session: WorkspaceSessionState | null
+    if (sessionByWorktreeId.has(pty.worktreeId)) {
+      session = sessionByWorktreeId.get(pty.worktreeId) ?? null
+    } else {
+      session = this.getWorkspaceSessionForWorktree(pty.worktreeId)
+      sessionByWorktreeId.set(pty.worktreeId, session)
+    }
+    if (!hasTimeRemaining()) {
+      return { isPersisted: null, rendererOwnsPersistedTab: null }
+    }
+    let persistedBindingIndex: IdleEmptyTerminalReclaimPersistedBindingIndex | null = null
+    if (session) {
+      persistedBindingIndex = persistedBindingsBySession.get(session) ?? null
+      if (persistedBindingIndex === null) {
+        persistedBindingIndex = indexIdleEmptyTerminalReclaimPersistedBindings(
+          session,
+          hasTimeRemaining
+        )
+        if (persistedBindingIndex !== null) {
+          persistedBindingsBySession.set(session, persistedBindingIndex)
+        }
+      }
+      if (persistedBindingIndex === null || !hasTimeRemaining()) {
+        return { isPersisted: null, rendererOwnsPersistedTab: null }
+      }
+    }
     return this.collectIdleEmptyTerminalReclaimOwnershipFacts(
       pty,
       session,
