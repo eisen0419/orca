@@ -337,7 +337,13 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
         ptyId: 'pty-hot',
         incarnationId: 'hot-incarnation',
         lastActivityAt: hotPty.lastActivityAt,
-        overrides: { rendererVisibility: 'hidden' }
+        overrides: {
+          isSinglePane: false,
+          isPinned: false,
+          isSleepingOrHibernating: false,
+          providerWritable: true,
+          rendererVisibility: 'hidden'
+        }
       })
     ])
     runtime.dispose()

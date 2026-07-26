@@ -33,6 +33,7 @@ import type {
   TerminalTab
 } from '../../../shared/types'
 import { resolveTerminalTabTitle } from '../../../shared/tab-title-resolution'
+import { getEffectiveLayoutForWorktree } from '../components/terminal/split-group-mount'
 import {
   getActiveTabNavOrder,
   getGroupVisibleTabOrder,
@@ -47,6 +48,7 @@ type RegisteredTerminalTab = {
   getManager: () => PaneManager | null
   getContainer: () => HTMLDivElement | null
   getPtyIdForPane: (paneId: number) => string | null
+  getRendererVisibility?: () => 'hidden' | 'visible' | null
 }
 
 type OpenFileByWorktreeAndId = Map<string, Map<string, AppState['openFiles'][number]>>
@@ -179,13 +181,48 @@ export function focusRuntimeTerminalSurface(tabId: string, leafId?: string | nul
 }
 
 export function setRuntimeGraphSyncEnabled(enabled: boolean): void {
+  if (syncEnabled === enabled) {
+    return
+  }
   syncEnabled = enabled
+  const runtimeDocument = typeof document === 'undefined' ? null : document
   if (!enabled) {
+    runtimeDocument?.removeEventListener('visibilitychange', scheduleRuntimeGraphSync)
     syncPendingAfterFlight = false
     clearScheduledRuntimeGraphSync()
     return
   }
+  runtimeDocument?.addEventListener('visibilitychange', scheduleRuntimeGraphSync)
   scheduleRuntimeGraphSync()
+}
+
+function layoutContainsTabGroup(layout: TabGroupLayoutNode, groupId: string): boolean {
+  if (layout.type === 'leaf') {
+    return layout.groupId === groupId
+  }
+  return (
+    layoutContainsTabGroup(layout.first, groupId) || layoutContainsTabGroup(layout.second, groupId)
+  )
+}
+
+function isRegisteredTerminalTabInVisibleLayout(
+  state: AppState,
+  tabId: string,
+  worktreeId: string
+): boolean {
+  const unifiedTab = (state.unifiedTabsByWorktree[worktreeId] ?? []).find(
+    (tab) => tab.contentType === 'terminal' && tab.entityId === tabId
+  )
+  if (!unifiedTab) {
+    return false
+  }
+  const layout = getEffectiveLayoutForWorktree(
+    worktreeId,
+    state.layoutByWorktree,
+    state.groupsByWorktree,
+    state.activeGroupIdByWorktree
+  )
+  return layout !== undefined && layoutContainsTabGroup(layout, unifiedTab.groupId)
 }
 
 function clearScheduledRuntimeGraphSync(): void {
@@ -586,6 +623,13 @@ async function syncRuntimeGraph(): Promise<void> {
     const activePaneId = manager?.getActivePane()?.id ?? null
     const root =
       container?.firstElementChild instanceof HTMLElement ? container.firstElementChild : null
+    const rendererVisibility = isRegisteredTerminalTabInVisibleLayout(
+      state,
+      tabId,
+      registeredTab.worktreeId
+    )
+      ? (registeredTab.getRendererVisibility?.() ?? null)
+      : null
 
     graph.tabs.push({
       tabId,
@@ -593,7 +637,7 @@ async function syncRuntimeGraph(): Promise<void> {
       title: resolveRuntimeTerminalTitle(tab, generatedTitlesEnabled),
       activeLeafId: activePaneId === null ? null : (manager?.getLeafId(activePaneId) ?? null),
       layout: serializePaneTree(root),
-      rendererVisibility: state.activeTabId === tabId ? 'visible' : 'hidden',
+      ...(rendererVisibility ? { rendererVisibility } : {}),
       ...(tab.creationOrigin ? { creationOrigin: tab.creationOrigin } : {}),
       ...(tab.hasEverReceivedExternalInput === true
         ? { hasEverReceivedExternalInput: true as const }

@@ -773,7 +773,13 @@ export function useTerminalPaneLifecycle({
       worktreeId,
       getManager: () => managerRef.current,
       getContainer: () => containerRef.current,
-      getPtyIdForPane: (paneId) => paneTransportsRef.current.get(paneId)?.getPtyId() ?? null
+      getPtyIdForPane: (paneId) => paneTransportsRef.current.get(paneId)?.getPtyId() ?? null,
+      getRendererVisibility: () =>
+        document.visibilityState === 'visible'
+          ? isVisibleRef.current
+            ? 'visible'
+            : 'hidden'
+          : null
     })
 
     const fileOpenLinkHint = getTerminalFileOpenHint()

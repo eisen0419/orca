@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { join } from 'node:path'
 import type { AgentStatusIpcPayload } from '../../shared/agent-status-types'
 import { getDefaultWorkspaceSession } from '../../shared/constants'
 import type { RuntimeMobileSessionTabsSnapshot } from '../../shared/runtime-types'
@@ -15,6 +16,7 @@ const HOT_LEAF_ID = '66666666-6666-4666-8666-666666666666'
 const HOT_PANE_KEY = `${HOT_TAB_ID}:${HOT_LEAF_ID}`
 const HOT_PTY_ID = 'pty-hot'
 const HOT_INCARNATION_ID = 'hot-incarnation'
+const WORKSPACE_DIR = join(process.cwd(), 'idle-empty-terminal-reclaim-fixture')
 
 type RuntimeIdleReclaimInternals = {
   graphStatus: 'unavailable' | 'reloading' | 'ready'
@@ -27,6 +29,7 @@ type RuntimeIdleReclaimInternals = {
   handleByPtyId: Map<string, string>
   handles: Map<string, unknown>
   reclaimInFlightByPtyId: Map<string, unknown>
+  launchFactsAuthoritativeIncarnationByPtyId: Map<string, string | null>
   removePersistedHeadlessTerminalTab: (...args: unknown[]) => string[]
   closeHeadlessMobileTerminalTab: (...args: unknown[]) => Promise<void>
   recordPtyWorktree: (
@@ -41,6 +44,7 @@ type RuntimeIdleReclaimInternals = {
     lastActivityAt: number
   }
   collectIdleEmptyTerminalReclaimCandidates: () => Promise<IdleEmptyTerminalReclaimCandidate[]>
+  tickIdleEmptyTerminalReclaim: () => Promise<void>
   collectIdleEmptyTerminalReclaimConfirmation: (
     candidate: IdleEmptyTerminalReclaimCandidate
   ) => Promise<IdleEmptyTerminalReclaimCandidate | null>
@@ -60,7 +64,7 @@ type RuntimeIdleReclaimInternals = {
 function makeStore(session: WorkspaceSessionState) {
   return {
     getSettings: () => ({
-      workspaceDir: '/tmp',
+      workspaceDir: WORKSPACE_DIR,
       nestWorkspaces: false,
       refreshLocalBaseRefOnWorktreeCreate: false,
       branchPrefix: '',
@@ -154,12 +158,17 @@ function createHotOnlyRuntime(options: {
   stopAndWait: (ptyId: string) => Promise<boolean>
   hasPty: (ptyId: string) => boolean | null
   getAgentStatusSnapshot?: () => AgentStatusIpcPayload[]
+  includeAgentStatusAuthority?: boolean
 }) {
   const session = getDefaultWorkspaceSession()
   const store = makeStore(session)
-  const runtime = new OrcaRuntimeService(store as never, undefined, {
-    getAgentStatusSnapshot: options.getAgentStatusSnapshot
-  })
+  const runtime = new OrcaRuntimeService(
+    store as never,
+    undefined,
+    options.includeAgentStatusAuthority === false
+      ? undefined
+      : { getAgentStatusSnapshot: options.getAgentStatusSnapshot ?? (() => []) }
+  )
   const internals = runtime as unknown as RuntimeIdleReclaimInternals
   internals.graphStatus = 'ready'
   internals.mobileSessionTabsByWorktree.set(WORKTREE_ID, makeHotSnapshot())
@@ -170,6 +179,7 @@ function createHotOnlyRuntime(options: {
     paneKey: HOT_PANE_KEY
   })
   pty.creationOrigin = 'cli'
+  internals.launchFactsAuthoritativeIncarnationByPtyId.set(HOT_PTY_ID, HOT_INCARNATION_ID)
   const spawn = vi.fn()
   runtime.setPtyController({
     spawn,
@@ -259,7 +269,8 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
     live = true
     const withoutProviderAuthority = createHotOnlyRuntime({
       stopAndWait: vi.fn(async () => true),
-      hasPty: () => live
+      hasPty: () => live,
+      includeAgentStatusAuthority: false
     })
     const [unreadableProvider] =
       await withoutProviderAuthority.internals.collectIdleEmptyTerminalReclaimCandidates()
@@ -296,36 +307,36 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
     duplicateProviderAuthority.runtime.dispose()
   })
 
-  it('retires the #10747 hot-only background shell without a persisted row or replacement PTY', async () => {
+  it('reclaims #10747 through the scheduler, evaluator, executor, and production exit contract', async () => {
     let live = true
+    let runtime: OrcaRuntimeService | null = null
     const stopAndWait = vi.fn(async () => {
       live = false
+      runtime?.onPtyExit(HOT_PTY_ID, -1, HOT_INCARNATION_ID)
       return true
     })
-    const { runtime, internals, pty, store, spawn } = createHotOnlyRuntime({
+    const created = createHotOnlyRuntime({
       stopAndWait,
       hasPty: () => live
     })
+    runtime = created.runtime
+    const { internals, pty, store, spawn } = created
+    pty.lastActivityAt = 0
+    runtime.setOrchestrationDb({
+      getActiveCoordinatorRun: () => undefined,
+      getActiveDispatchAssignees: () => []
+    } as never)
     const removePersistedTab = vi.spyOn(internals, 'removePersistedHeadlessTerminalTab')
     const closeMobileTab = vi.spyOn(internals, 'closeHeadlessMobileTerminalTab')
 
-    const candidate = fullyEligibleHotCandidate(pty.activityGeneration)
-    vi.spyOn(internals, 'collectIdleEmptyTerminalReclaimConfirmation').mockResolvedValue(candidate)
-
-    await expect(
-      internals.reclaimHotOnlyIdleTerminal(candidate, { enabled: true })
-    ).resolves.toMatchObject({
-      decision: { eligible: true, closeMode: 'hot-only' },
-      reclaimed: true
-    })
+    await internals.tickIdleEmptyTerminalReclaim()
 
     expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    expect(live).toBe(false)
     expect(internals.mobileSessionTabsByWorktree.get(WORKTREE_ID)?.tabs).toEqual([])
     await expect(runtime.listMobileSessionTabs(`id:${WORKTREE_ID}`)).resolves.toMatchObject({
       tabs: []
     })
-    expect(store.setWorkspaceSession).not.toHaveBeenCalled()
-    expect(store.flushOrThrow).not.toHaveBeenCalled()
     expect(store.createTerminalArchiveStore).not.toHaveBeenCalled()
     expect(removePersistedTab).not.toHaveBeenCalled()
     expect(closeMobileTab).not.toHaveBeenCalled()
@@ -374,30 +385,28 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
     runtime.dispose()
   })
 
-  it('does not remove hot mappings when identity changes while stop is in flight', async () => {
+  it('aborts before stop when activity changes during final confirmation', async () => {
     let live = true
-    let updateLiveIdentity = () => {}
-    const stopAndWait = vi.fn(async () => {
-      live = false
-      updateLiveIdentity()
-      return true
-    })
+    const stopAndWait = vi.fn(async () => true)
     const { runtime, internals, pty, store } = createHotOnlyRuntime({
       stopAndWait,
       hasPty: () => live
     })
     const candidate = fullyEligibleHotCandidate(pty.activityGeneration)
-    updateLiveIdentity = () => {
-      pty.creationOrigin = 'user'
-    }
-    vi.spyOn(internals, 'collectIdleEmptyTerminalReclaimConfirmation').mockResolvedValue(candidate)
+    vi.spyOn(internals, 'collectIdleEmptyTerminalReclaimConfirmation').mockImplementation(
+      async () => {
+        pty.activityGeneration += 1
+        return candidate
+      }
+    )
 
     await expect(
       internals.reclaimHotOnlyIdleTerminal(candidate, { enabled: true })
     ).resolves.toMatchObject({
-      decision: { eligible: true, closeMode: 'hot-only' },
+      decision: { eligible: false, reason: 'final-confirmation-or-claim-missing' },
       reclaimed: false
     })
+    expect(stopAndWait).not.toHaveBeenCalled()
     expect(internals.mobileSessionTabsByWorktree.get(WORKTREE_ID)?.tabs).toHaveLength(1)
     expect(internals.ptysById.has(HOT_PTY_ID)).toBe(true)
     expect(store.setWorkspaceSession).not.toHaveBeenCalled()
@@ -409,27 +418,38 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
 
   it('fences concurrent reclaim attempts and releases the claim after provider failure', async () => {
     let live = true
+    let runtime: OrcaRuntimeService | null = null
     let releaseStop!: () => void
     const stop = new Promise<boolean>((resolve) => {
       releaseStop = () => resolve(true)
     })
+    let stopCalls = 0
     const stopAndWait = vi.fn(async () => {
-      const stopped = await stop
+      stopCalls += 1
+      const stopped = stopCalls === 1 ? await stop : true
       live = false
+      runtime?.onPtyExit(HOT_PTY_ID, -1, HOT_INCARNATION_ID)
       return stopped
     })
-    const { runtime, internals, pty } = createHotOnlyRuntime({ stopAndWait, hasPty: () => live })
+    const created = createHotOnlyRuntime({ stopAndWait, hasPty: () => live })
+    runtime = created.runtime
+    const { internals, pty } = created
     const candidate = fullyEligibleHotCandidate(pty.activityGeneration)
     vi.spyOn(internals, 'collectIdleEmptyTerminalReclaimConfirmation').mockResolvedValue(candidate)
 
     const first = internals.reclaimHotOnlyIdleTerminal(candidate, { enabled: true })
     await vi.waitFor(() => expect(stopAndWait).toHaveBeenCalledOnce())
-    await expect(
-      internals.reclaimHotOnlyIdleTerminal(candidate, { enabled: true })
-    ).resolves.toBeNull()
-    releaseStop()
-    await expect(first).resolves.toMatchObject({ reclaimed: true })
-    expect(internals.reclaimInFlightByPtyId).toEqual(new Map())
+    const second = internals.reclaimHotOnlyIdleTerminal(candidate, { enabled: true })
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      expect(stopAndWait).toHaveBeenCalledOnce()
+      await expect(second).resolves.toBeNull()
+      releaseStop()
+      await expect(first).resolves.toMatchObject({ reclaimed: true })
+      expect(internals.reclaimInFlightByPtyId).toEqual(new Map())
+    } finally {
+      releaseStop()
+    }
     runtime.dispose()
 
     const throwing = createHotOnlyRuntime({

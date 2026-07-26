@@ -124,6 +124,7 @@ describe('syncRuntimeGraph background automation tabs', () => {
       title: 'Generate PO review prep brief',
       activeLeafId: LEAF,
       layout: { type: 'leaf', leafId: LEAF },
+      rendererVisibility: 'hidden',
       creationOrigin: 'cli',
       hasEverReceivedExternalInput: true
     })

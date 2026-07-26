@@ -136,6 +136,63 @@ describe('scheduleRuntimeGraphSync', () => {
     unregister()
   })
 
+  it('publishes an on-screen active tab from a non-focused split group as visible', async () => {
+    vi.useFakeTimers()
+    const syncWindowGraph = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('window', { api: { runtime: { syncWindowGraph } } })
+    vi.stubGlobal('HTMLElement', class HTMLElement {})
+    const unregister = registerRuntimeTerminalTab({
+      tabId: 'term-side',
+      worktreeId: 'wt-1',
+      getManager: () => null,
+      getContainer: () => null,
+      getPtyIdForPane: () => null,
+      getRendererVisibility: () => 'visible'
+    })
+    setRuntimeGraphStoreStateGetter(() =>
+      makeState({
+        activeTabId: 'term-focused',
+        tabsByWorktree: {
+          'wt-1': [{ ...makeTerminalTab(), id: 'term-side' }]
+        } as AppState['tabsByWorktree'],
+        groupsByWorktree: {
+          'wt-1': [
+            { id: 'group-focused', activeTabId: 'focused-tab', tabOrder: ['focused-tab'] },
+            { id: 'group-side', activeTabId: 'side-tab', tabOrder: ['side-tab'] }
+          ]
+        } as unknown as AppState['groupsByWorktree'],
+        activeGroupIdByWorktree: { 'wt-1': 'group-focused' },
+        unifiedTabsByWorktree: {
+          'wt-1': [
+            {
+              id: 'side-tab',
+              groupId: 'group-side',
+              contentType: 'terminal',
+              entityId: 'term-side',
+              title: 'Side terminal'
+            }
+          ]
+        } as unknown as AppState['unifiedTabsByWorktree'],
+        layoutByWorktree: {
+          'wt-1': {
+            type: 'split',
+            direction: 'horizontal',
+            first: { type: 'leaf', groupId: 'group-focused' },
+            second: { type: 'leaf', groupId: 'group-side' }
+          }
+        } as AppState['layoutByWorktree']
+      })
+    )
+
+    setRuntimeGraphSyncEnabled(true)
+    await flushRuntimeGraphSyncTimer()
+
+    expect(syncWindowGraph.mock.calls[0]?.[0].tabs).toEqual([
+      expect.objectContaining({ tabId: 'term-side', rendererVisibility: 'visible' })
+    ])
+    unregister()
+  })
+
   it('coalesces updates that arrive while the runtime graph IPC is in flight', async () => {
     vi.useFakeTimers()
     const syncCalls: {

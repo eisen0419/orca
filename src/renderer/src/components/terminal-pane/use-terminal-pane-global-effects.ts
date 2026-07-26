@@ -26,6 +26,7 @@ import {
   releaseRendererPtyVisibilityClaim,
   setRendererPtyVisibilityClaim
 } from './pty-renderer-delivery-claims'
+import { scheduleRuntimeGraphSync } from '@/runtime/sync-runtime-graph'
 
 type UseTerminalPaneGlobalEffectsArgs = {
   tabId: string
@@ -146,6 +147,7 @@ export function useTerminalPaneGlobalEffects({
     const wasWorktreeActive = wasWorktreeActiveRef.current
     isActiveRef.current = isActive
     isVisibleRef.current = rendererVisible
+    scheduleRuntimeGraphSync()
     if (rendererVisible) {
       const shouldUseLightTabResume =
         isWorktreeActive &&

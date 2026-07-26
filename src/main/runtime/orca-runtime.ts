@@ -2757,6 +2757,11 @@ export class OrcaRuntimeService {
     string,
     { incarnationId: string; activityGeneration: number }
   >()
+  // Lets onPtyExit preserve the claim generation for the stop this transaction initiated.
+  private reclaimStopInFlightByPtyId = new Map<
+    string,
+    { incarnationId: string; activityGeneration: number }
+  >()
   private readonly idleEmptyTerminalReclaimScheduler = new IdleEmptyTerminalReclaimScheduler(
     () => this.tickIdleEmptyTerminalReclaim(),
     {
@@ -3487,59 +3492,52 @@ export class OrcaRuntimeService {
       return false
     }
     const controller = this.ptyController
-    if (!controller?.hasPty || controller.hasPty(ptyId) !== true) {
+    if (!controller?.hasPty || !controller.stopAndWait || controller.hasPty(ptyId) !== true) {
       return false
     }
-    const stopped = controller.stopAndWait
-      ? await controller.stopAndWait(ptyId)
-      : Boolean(controller.kill?.(ptyId))
-    if (!stopped || controller.hasPty(ptyId) !== false) {
-      return false
-    }
-    if (
-      !this.hasExactIdleEmptyTerminalReclaimClaim(candidate, claim) ||
-      !this.hasExactHotOnlyIdleTerminalOwnership(candidate)
-    ) {
-      return false
-    }
-    this.onPtyExit(ptyId, 0, claim.incarnationId, { skipMobileSessionRetirement: true })
-    const exitedPty = this.ptysById.get(ptyId)
-    if (!exitedPty || exitedPty.incarnationId !== claim.incarnationId || exitedPty.connected) {
-      return false
-    }
-    const snapshot = this.mobileSessionTabsByWorktree.get(worktreeId)
-    if (!snapshot) {
-      return false
-    }
-    const retired = retireTerminalSurfacesFromSnapshot({
-      snapshot,
-      ptyId,
-      exactSurfaces: [{ parentTabId: tabId, leafId }],
-      exactOnly: true
-    })
-    if (!retired) {
-      return false
-    }
-    this.mobileSessionTabsByWorktree.set(worktreeId, retired.snapshot)
-    this.notifyMobileSessionTabsChanged(worktreeId)
-    const exactLeafKey = this.getLeafKey(tabId, leafId)
-    for (const [leafKey, leaf] of this.leaves) {
-      if (leaf.ptyId !== ptyId) {
-        continue
-      }
-      if (leafKey !== exactLeafKey || leaf.tabId !== tabId || leaf.leafId !== leafId) {
+    this.reclaimStopInFlightByPtyId.set(ptyId, claim)
+    try {
+      // Point of no return: all identity, ownership, and provider checks are above this stop.
+      const stopped = await controller.stopAndWait(ptyId)
+      if (!stopped || controller.hasPty(ptyId) !== false) {
         return false
       }
-      this.leaves.delete(leafKey)
+      const exitedPty = this.ptysById.get(ptyId)
+      if (
+        !exitedPty ||
+        exitedPty.incarnationId !== claim.incarnationId ||
+        exitedPty.activityGeneration !== claim.activityGeneration ||
+        exitedPty.connected
+      ) {
+        return false
+      }
+      const snapshot = this.mobileSessionTabsByWorktree.get(worktreeId)
+      if (snapshot) {
+        const retired = retireTerminalSurfacesFromSnapshot({
+          snapshot,
+          ptyId,
+          exactSurfaces: [{ parentTabId: tabId, leafId }],
+          exactOnly: true
+        })
+        if (retired) {
+          this.mobileSessionTabsByWorktree.set(worktreeId, retired.snapshot)
+          this.notifyMobileSessionTabsChanged(worktreeId)
+        }
+      }
+      this.leaves.delete(this.getLeafKey(tabId, leafId))
+      this.rebuildLeafPtyIndex()
+      this.invalidateAllHandlesForPty(ptyId)
+      this.detachedPreAllocatedLeaves.delete(ptyId)
+      this.disposeHeadlessTerminal(ptyId)
+      if (this.ptysById.get(ptyId)?.incarnationId === claim.incarnationId) {
+        this.dropDisconnectedPtyRecord(ptyId)
+      }
+      return true
+    } finally {
+      if (this.reclaimStopInFlightByPtyId.get(ptyId) === claim) {
+        this.reclaimStopInFlightByPtyId.delete(ptyId)
+      }
     }
-    this.rebuildLeafPtyIndex()
-    this.invalidateAllHandlesForPty(ptyId)
-    this.detachedPreAllocatedLeaves.delete(ptyId)
-    this.disposeHeadlessTerminal(ptyId)
-    if (this.ptysById.get(ptyId)?.incarnationId === claim.incarnationId) {
-      this.dropDisconnectedPtyRecord(ptyId)
-    }
-    return true
   }
 
   private hasExactHotOnlyIdleTerminalOwnership(
@@ -3936,13 +3934,26 @@ export class OrcaRuntimeService {
       rendererOwnsPersistedTab
     } = ownership
     const persistedLeafIds = this.collectPersistedTerminalLeafIds(persistedLayout)
+    const hotOnlySnapshot =
+      isPersisted === false && rendererOwnsPersistedTab === false && tabId && leafId
+        ? this.mobileSessionTabsByWorktree.get(pty.worktreeId)
+        : undefined
+    const hotOnlySurfaces = hotOnlySnapshot?.tabs.filter(
+      (tab): tab is RuntimeMobileSessionTerminalTab =>
+        tab.type === 'terminal' && tab.parentTabId === tabId
+    )
     const rendererLeafCount = tabId ? (tick.rendererLeafCountByTabId?.get(tabId) ?? null) : null
     const isSinglePane =
       isPersisted === true && hasExactPersistedBinding
         ? persistedLeafIds.length === 1
         : hasExactRendererBinding
           ? rendererLeafCount === 1
-          : null
+          : isPersisted === false && rendererOwnsPersistedTab === false
+            ? hotOnlySurfaces?.length === 1 &&
+              hotOnlySurfaces[0]?.leafId === leafId &&
+              (hotOnlySurfaces[0]?.parentLayout?.ptyIdsByLeafId?.[leafId] ??
+                hotOnlySurfaces[0]?.ptyId) === pty.ptyId
+            : null
     const rendererPtyReferences =
       rendererGraphAvailable && tick.rendererPtyReferenceCount
         ? (tick.rendererPtyReferenceCount.get(pty.ptyId) ?? 0)
@@ -4000,9 +4011,14 @@ export class OrcaRuntimeService {
       rendererOwnsPersistedTab,
       origin: pty.creationOrigin,
       used: pty.hasEverReceivedExternalInput,
-      isPinned: isPersisted === true ? persistedTab?.isPinned === true : null,
+      isPinned:
+        isPersisted === true
+          ? persistedTab?.isPinned === true
+          : isPersisted === false
+            ? false
+            : null,
       isSleepingOrHibernating:
-        isPersisted === true && pane
+        (isPersisted === true || isPersisted === false) && pane
           ? Boolean(session?.sleepingAgentSessionsByPaneKey?.[makePaneKey(pane.tabId, pane.leafId)])
           : null,
       hasPendingRestoreOrReconnect: this.pendingRestoreTimers.has(pty.ptyId)
@@ -4040,7 +4056,9 @@ export class OrcaRuntimeService {
       hasOrchestrationOwnership: orchestration.hasOrchestrationOwnership,
       lastActivityAt: pty.lastActivityAt,
       providerConnected: null,
-      providerWritable: rendererLeaf ? rendererLeaf.writable : null,
+      providerWritable:
+        rendererLeaf?.writable ??
+        (isPersisted === false && rendererOwnsPersistedTab === false ? pty.connected : null),
       rendererVisibility,
       hasMobileDriver: this.getDriver(pty.ptyId).kind === 'mobile',
       hasMobileSubscriber,
@@ -12161,7 +12179,14 @@ export class OrcaRuntimeService {
       exitIncarnationId ??
       pty?.incarnationId ??
       `runtime:${this.runtimeId}:${this.getPtyLifecycleGeneration(ptyId)}`
-    this.invalidateIdleEmptyTerminalReclaimActivity(ptyId)
+    const reclaimStop = this.reclaimStopInFlightByPtyId.get(ptyId)
+    const exitWasInitiatedByExactReclaimStop =
+      reclaimStop !== undefined &&
+      pty?.incarnationId === reclaimStop.incarnationId &&
+      pty.activityGeneration === reclaimStop.activityGeneration
+    if (!exitWasInitiatedByExactReclaimStop) {
+      this.invalidateIdleEmptyTerminalReclaimActivity(ptyId)
+    }
     this.advancePtyLifecycleGeneration(ptyId)
     const exactSurfaceByKey = new Map<
       string,
