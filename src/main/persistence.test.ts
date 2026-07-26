@@ -4947,6 +4947,28 @@ describe('Store', () => {
     })
   })
 
+  it('keeps accepted terminal input hot and retries its persistence after a transient flush failure', async () => {
+    const store = await createStore()
+    store.persistPtyBinding({
+      worktreeId: 'wt-flush-retry',
+      tabId: 'tab-flush-retry',
+      leafId: TEST_LEAF_1,
+      ptyId: 'flush-retry-pty'
+    })
+    const flush = vi.spyOn(store, 'flushOrThrow')
+    flush.mockImplementationOnce(() => {
+      throw new Error('transient disk failure')
+    })
+
+    expect(() => store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')).not.toThrow()
+    expect(store.getWorkspaceSession().tabsByWorktree['wt-flush-retry']?.[0]).toMatchObject({
+      hasEverReceivedExternalInput: true
+    })
+
+    store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')
+    expect(flush).toHaveBeenCalledTimes(2)
+  })
+
   it('does not let a stale renderer session clear persisted terminal input', async () => {
     const store = await createStore()
     const session = {

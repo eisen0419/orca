@@ -1457,9 +1457,12 @@ export function createRemoteRuntimePtyTransport(
     if (pendingViewportClaim && desiredViewport) {
       nextStream.claimViewport(desiredViewport.cols, desiredViewport.rows)
       pendingViewportClaim = false
-      const queuedInput = pendingClaimInput.take()
-      if (queuedInput) {
-        nextStream.sendInput(queuedInput)
+      const queuedInput = pendingClaimInput.takeEntries()
+      for (const input of queuedInput) {
+        nextStream.sendInput(
+          input.text,
+          input.inputKind === 'query-reply' ? 'query-reply' : undefined
+        )
       }
       for (const resolve of viewportClaimReadyWaiters) {
         resolve(true)
@@ -1857,22 +1860,30 @@ export function createRemoteRuntimePtyTransport(
       }
       const pending = inputBatcher.takePending()
       const text = `${pending}${data}`
+      const inputKind = pending ? undefined : 'query-reply'
       const stream = getCurrentMultiplexedStream(targetHandle)
-      if (stream?.sendInput(text)) {
+      if (stream?.sendInput(text, inputKind)) {
         return true
       }
       if (pendingViewportClaim) {
-        return pendingClaimInput.append(text)
+        return pendingClaimInput.append(text, inputKind ?? 'external')
       }
-      void callRuntime('terminal.send', {
+      void callRuntime<{ send: RuntimeTerminalSend }>('terminal.send', {
         terminal: targetHandle,
         text,
-        inputKind: 'query-reply',
+        ...(inputKind ? { inputKind } : {}),
         client: { id: clientId, type: 'desktop' },
         ...(desiredViewport ? { viewport: desiredViewport, claimViewport: true as const } : {})
-      }).catch((error) => {
-        handleRemoteTerminalError(error)
       })
+        .then((result: { send: RuntimeTerminalSend }) => {
+          if (result.send.accepted !== true) {
+            inputBatcher.restorePending(text)
+          }
+        })
+        .catch((error) => {
+          inputBatcher.restorePending(text)
+          handleRemoteTerminalError(error)
+        })
       return true
     },
 

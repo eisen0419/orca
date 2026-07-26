@@ -11,6 +11,7 @@ export type RemoteRuntimePtyBatcher = {
   hasPendingValidation: () => boolean
   drain: () => Promise<void>
   takePending: () => string
+  restorePending: (data: string) => void
   flush: () => void
   clear: () => void
 }
@@ -86,6 +87,18 @@ export function createRemoteRuntimePtyTextBatcher(
     pendingBytes = 0
     clearTimer()
     return text
+  }
+
+  const restorePending = (data: string): void => {
+    if (!data) {
+      return
+    }
+    // Why: an immediate RPC can fail after taking queued keystrokes; restore at the front so later input cannot overtake them.
+    pending = data + pending
+    pendingBytes += getTerminalInputByteLength(data)
+    if (!timer) {
+      timer = setTimeout(flush, delayMs)
+    }
   }
 
   const queuePending = (chunk: string, chunkBytes: number): void => {
@@ -180,6 +193,7 @@ export function createRemoteRuntimePtyTextBatcher(
     hasPendingValidation: (): boolean => validationTail !== null,
     drain,
     takePending,
+    restorePending,
     flush,
     clear
   }

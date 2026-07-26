@@ -2694,6 +2694,7 @@ export class Store {
   private writeTimer: ReturnType<typeof setTimeout> | null = null
   private pendingWrite: Promise<void> | null = null
   private writeGeneration = 0
+  private terminalExternalInputPersistenceDirty = false
   // Why: after a profile transfer rewrites this file on disk, a late flush of stale in-memory state would resurrect the moved project.
   private writesFrozen = false
   // Content hash at last write, to skip no-op writes; derived from the payload with encrypted blobs normalized back to plaintext (see buildStateToSave), since encrypt() uses a random IV per call.
@@ -6511,11 +6512,14 @@ export class Store {
     const resolvedHostId = this.resolveHostId(hostId)
     const session = this.getWorkspaceSession(resolvedHostId)
     const tab = session.tabsByWorktree?.[worktreeId]?.find((candidate) => candidate.id === tabId)
-    if (!tab || tab.hasEverReceivedExternalInput === true) {
+    if (
+      !tab ||
+      (tab.hasEverReceivedExternalInput === true && !this.terminalExternalInputPersistenceDirty)
+    ) {
       return
     }
-    const previous = cloneWorkspaceSessionState(session)
     tab.hasEverReceivedExternalInput = true
+    this.terminalExternalInputPersistenceDirty = true
     if (resolvedHostId !== LOCAL_EXECUTION_HOST_ID) {
       this.state.workspaceSessionsByHostId = {
         ...this.state.workspaceSessionsByHostId,
@@ -6524,16 +6528,9 @@ export class Store {
     }
     try {
       this.flushOrThrow()
-    } catch (error) {
-      if (resolvedHostId === LOCAL_EXECUTION_HOST_ID) {
-        this.state.workspaceSession = previous
-      } else {
-        this.state.workspaceSessionsByHostId = {
-          ...this.state.workspaceSessionsByHostId,
-          [resolvedHostId]: previous
-        }
-      }
-      throw error
+      this.terminalExternalInputPersistenceDirty = false
+    } catch {
+      // Why: provider-accepted terminal input is irreversible; retain the hot fact and retry its durability on a later input.
     }
   }
 

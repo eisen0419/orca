@@ -1198,6 +1198,7 @@ type RuntimePtyWorktreeRecord = {
 type TerminalCreateOptions = {
   command?: string
   creationOrigin?: TerminalCreationOrigin
+  hasEverReceivedExternalInput?: true
   claudeAgentTeamsSourceCommand?: string
   cwd?: string
   env?: Record<string, string>
@@ -21916,7 +21917,8 @@ export class OrcaRuntimeService {
         tabId,
         leafId,
         creationOrigin: launchOpts.creationOrigin ?? 'user',
-        ...(launchOpts.command?.trim() ||
+        ...(launchOpts.hasEverReceivedExternalInput === true ||
+        launchOpts.command?.trim() ||
         effectiveLaunchConfig ||
         launchOpts.resumeProviderSession ||
         launchOpts.launchAgent
@@ -21996,6 +21998,7 @@ export class OrcaRuntimeService {
         pty.launchAgent = launchOpts.launchAgent ?? null
         pty.creationOrigin = launchOpts.creationOrigin ?? 'user'
         if (
+          launchOpts.hasEverReceivedExternalInput === true ||
           launchOpts.command?.trim() ||
           effectiveLaunchConfig ||
           launchOpts.resumeProviderSession ||
@@ -22122,7 +22125,8 @@ export class OrcaRuntimeService {
         ...(launchOpts.launchAgent ? { launchAgent: launchOpts.launchAgent } : {}),
         ...(launchOpts.viewMode ? { viewMode: launchOpts.viewMode } : {}),
         creationOrigin: launchOpts.creationOrigin ?? 'user',
-        ...(launchOpts.command?.trim() ||
+        ...(launchOpts.hasEverReceivedExternalInput === true ||
+        launchOpts.command?.trim() ||
         launchOpts.launchConfig ||
         launchOpts.resumeProviderSession ||
         launchOpts.launchAgent
@@ -25387,7 +25391,11 @@ export class OrcaRuntimeService {
     pty.activityGeneration += 1
     if (pty.tabId) {
       const hostId = this.store?.getWorkspaceSessionHostIdForWorktree?.(pty.worktreeId)
-      this.store?.markTerminalExternalInput?.(pty.worktreeId, pty.tabId, hostId)
+      try {
+        this.store?.markTerminalExternalInput?.(pty.worktreeId, pty.tabId, hostId)
+      } catch {
+        // Why: input already reached the provider; persistence must retry later without reporting a duplicate-prone write failure.
+      }
       this.notifier?.terminalExternalInput?.({ ptyId, tabId: pty.tabId })
     }
   }

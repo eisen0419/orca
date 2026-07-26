@@ -376,6 +376,37 @@ describe('terminal send RPC', () => {
     expect(runtime.mobileTookFloor).not.toHaveBeenCalled()
   })
 
+  it('accepts a pure desktop query reply without taking the mobile floor', async () => {
+    const runtime = stubRuntime({
+      resolveLiveLeafForHandle: vi.fn().mockReturnValue({ ptyId: 'pty-1' }),
+      getDriver: vi.fn().mockReturnValue({ kind: 'desktop' }),
+      sendTerminal: vi.fn().mockResolvedValue({
+        handle: 'terminal-1',
+        accepted: true,
+        bytesWritten: 6
+      }),
+      mobileTookFloor: vi.fn()
+    })
+    const dispatcher = new RpcDispatcher({ runtime, methods: TERMINAL_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('terminal.send', {
+        terminal: 'terminal-1',
+        text: '\x1b[3;4R',
+        inputKind: 'query-reply',
+        client: { id: 'desktop-1', type: 'desktop' }
+      })
+    )
+
+    expect(response).toMatchObject({ ok: true, result: { send: { accepted: true } } })
+    expect(runtime.sendTerminal).toHaveBeenCalledWith(
+      'terminal-1',
+      { text: '\x1b[3;4R', enter: false, interrupt: false },
+      { beforeWrite: undefined, inputKind: 'protocol-reply' }
+    )
+    expect(runtime.mobileTookFloor).not.toHaveBeenCalled()
+  })
+
   it('accepts a query reply from only the elected mobile subscriber', async () => {
     const runtime = stubRuntime({
       resolveLiveLeafForHandle: vi.fn().mockReturnValue({ ptyId: 'pty-1' }),

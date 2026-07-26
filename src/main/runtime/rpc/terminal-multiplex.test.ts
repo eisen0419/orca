@@ -138,6 +138,52 @@ function sendDesktopMultiplexSubscribe(
 }
 
 describe('terminal multiplex RPC', () => {
+  it('classifies tagged desktop query replies without changing old input framing', async () => {
+    const harness = startDesktopMultiplexSubscribe({
+      sendTerminal: vi.fn().mockResolvedValue({
+        handle: 'terminal-1',
+        accepted: true,
+        bytesWritten: 6
+      })
+    })
+
+    await vi.waitFor(() =>
+      expect(harness.messages.some((msg) => JSON.parse(msg).result?.type === 'ready')).toBe(true)
+    )
+    sendDesktopMultiplexSubscribe(harness.handlers)
+    await vi.waitFor(() => expect(harness.handlers.has(7)).toBe(true))
+    const send = harness.handlers.get(7)!
+    send(
+      decodeTerminalStreamFrame(
+        encodeTerminalStreamFrame({
+          opcode: TerminalStreamOpcode.Metadata,
+          streamId: 7,
+          seq: 2,
+          payload: encodeTerminalStreamJson({ inputKind: 'query-reply' })
+        })
+      )!
+    )
+    send(
+      decodeTerminalStreamFrame(
+        encodeTerminalStreamFrame({
+          opcode: TerminalStreamOpcode.Input,
+          streamId: 7,
+          seq: 3,
+          payload: encodeTerminalStreamText('\x1b[3;4R')
+        })
+      )!
+    )
+
+    await vi.waitFor(() => expect(harness.runtime.sendTerminal).toHaveBeenCalledOnce())
+    expect(harness.runtime.sendTerminal).toHaveBeenCalledWith(
+      'terminal-1',
+      { text: '\x1b[3;4R', enter: false, interrupt: false },
+      { inputKind: 'protocol-reply' }
+    )
+    harness.cleanups.get('terminal-multiplex:conn-desktop-first-paint')?.()
+    await harness.dispatchPromise
+  })
+
   it.each(['refuses', 'throws'] as const)(
     'closes without reserving ACK debt when the transport %s an output frame',
     async (failureMode) => {

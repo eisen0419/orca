@@ -104,6 +104,7 @@ type TerminalMultiplexStream = {
   ptyId: string
   client: TerminalViewportClient | undefined
   isMobile: boolean
+  pendingInputKind: 'query-reply' | null
   ackOutput: boolean
   ackInFlightBytes: number
   ackWindowBytes: number
@@ -362,6 +363,7 @@ async function sendTerminalStreamInput(
     text: string
     client: TerminalViewportClient | undefined
     isMobile: boolean
+    inputKind?: 'query-reply'
   }
 ): Promise<void> {
   const action = { text: args.text, enter: false, interrupt: false }
@@ -369,7 +371,9 @@ async function sendTerminalStreamInput(
   const floorClaim: MobileInputFloorClaimHolder = { current: null }
   try {
     if (!clientId) {
-      await runtime.sendTerminal(args.terminal, action)
+      await (args.inputKind === 'query-reply'
+        ? runtime.sendTerminal(args.terminal, action, { inputKind: 'protocol-reply' })
+        : runtime.sendTerminal(args.terminal, action))
       return
     }
     const result = await runtime.sendTerminal(args.terminal, action, {
@@ -380,7 +384,8 @@ async function sendTerminalStreamInput(
         }
         floorClaim.current = claim
       },
-      afterWrite: () => commitMobileInputFloorClaim(floorClaim)
+      afterWrite: () => commitMobileInputFloorClaim(floorClaim),
+      ...(args.inputKind === 'query-reply' ? { inputKind: 'protocol-reply' as const } : {})
     })
     if (!result.accepted) {
       floorClaim.current?.rollback()
@@ -1060,6 +1065,10 @@ const TerminalMultiplexSnapshotRequestFrame = z.object({
   scrollbackRows: z.number().finite().optional()
 })
 
+const TerminalMultiplexInputMetadataFrame = z.object({
+  inputKind: z.literal('query-reply')
+})
+
 const TerminalSetDisplayMode = TerminalHandle.extend({
   // Why: 'auto' = mobile drives dims while subscribed (desktop restores on last-leave); 'desktop' = no resize, mobile scales to fit.
   mode: z.enum(['auto', 'desktop']),
@@ -1207,7 +1216,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
           params.enter === true ||
           params.interrupt === true ||
           params.requireAgentStatus !== undefined ||
-          params.client?.type !== 'mobile' ||
+          (params.client?.type !== 'mobile' && params.client?.type !== 'desktop') ||
           !queryReplyClientId ||
           (clientId !== undefined && params.client.id !== clientId))
       ) {
@@ -1218,6 +1227,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
       const driver = leaf?.ptyId ? runtime.getDriver(leaf.ptyId) : null
       if (
         params.inputKind === 'query-reply' &&
+        params.client?.type === 'mobile' &&
         leaf?.ptyId &&
         !runtime.isMobileTerminalQueryReplyAuthority(leaf.ptyId, queryReplyClientId!)
       ) {
@@ -1932,6 +1942,8 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
         }
         if (frame.opcode === TerminalStreamOpcode.Input) {
           const text = decodeTerminalStreamText(frame.payload)
+          const inputKind = stream.pendingInputKind
+          stream.pendingInputKind = null
           if (!text) {
             return
           }
@@ -1948,9 +1960,17 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
               terminal: stream.terminal,
               text,
               client: stream.client,
-              isMobile: stream.isMobile
+              isMobile: stream.isMobile,
+              ...(inputKind === 'query-reply' && isTerminalQueryReply(text) ? { inputKind } : {})
             })
           })
+          return
+        }
+        if (frame.opcode === TerminalStreamOpcode.Metadata) {
+          const metadata = TerminalMultiplexInputMetadataFrame.safeParse(
+            decodeTerminalStreamJson<unknown>(frame.payload) ?? {}
+          )
+          stream.pendingInputKind = metadata.success ? metadata.data.inputKind : null
           return
         }
         if (frame.opcode === TerminalStreamOpcode.Resize && stream.client) {
@@ -2241,6 +2261,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
           ptyId,
           client: request.client,
           isMobile,
+          pendingInputKind: null,
           ackOutput: request.capabilities?.ackOutput === 1,
           ackInFlightBytes: 0,
           ackWindowBytes: TERMINAL_MULTIPLEX_ACK_STREAM_INITIAL_WINDOW_BYTES,

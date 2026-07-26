@@ -1656,6 +1656,30 @@ describe('OrcaRuntimeService', () => {
     expect(markTerminalExternalInput).toHaveBeenCalledWith(TEST_WORKTREE_ID, 'tab-1', undefined)
   })
 
+  it('keeps an accepted terminal write successful when persistence transiently fails', async () => {
+    const markTerminalExternalInput = vi.fn(() => {
+      throw new Error('transient disk failure')
+    })
+    const runtime = new OrcaRuntimeService({ ...store, markTerminalExternalInput })
+    runtime.setPtyController({
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+    syncSinglePty(runtime)
+    const [terminal] = (await runtime.listTerminals()).terminals
+
+    await expect(
+      runtime.sendTerminal(terminal.handle, { text: 'accepted input' })
+    ).resolves.toMatchObject({
+      accepted: true
+    })
+    const internals = runtime as unknown as {
+      ptysById: Map<string, { hasEverReceivedExternalInput: boolean }>
+    }
+    expect(internals.ptysById.get('pty-1')?.hasEverReceivedExternalInput).toBe(true)
+  })
+
   it('records the first accepted chunk even when a later terminal send fails', async () => {
     let writes = 0
     const runtime = new OrcaRuntimeService(store)
@@ -2627,6 +2651,18 @@ describe('OrcaRuntimeService', () => {
       tabId,
       leafId: HEADLESS_LEAF_ID
     })
+    const internals = runtime as unknown as {
+      ptysById: Map<
+        string,
+        {
+          creationOrigin: 'user' | 'cli' | 'orchestration' | null
+          hasEverReceivedExternalInput: boolean
+        }
+      >
+    }
+    const expiredPty = internals.ptysById.get('pty-expired')!
+    expiredPty.creationOrigin = 'cli'
+    expiredPty.hasEverReceivedExternalInput = true
     const expiredHandle = runtime.resolveTerminalPane(paneKey, TEST_WORKTREE_ID).handle
     runtime.onPtyExit('pty-expired', 0)
     const createTerminal = vi.spyOn(runtime, 'createTerminal').mockResolvedValue({
@@ -2651,7 +2687,39 @@ describe('OrcaRuntimeService', () => {
       tabId,
       leafId: HEADLESS_LEAF_ID,
       focus: false,
+      creationOrigin: 'cli',
+      hasEverReceivedExternalInput: true,
       persistHostSessionBinding: true
+    })
+    runtime.registerPty('pty-replacement', TEST_WORKTREE_ID, null, {
+      tabId,
+      leafId: HEADLESS_LEAF_ID
+    })
+    runtime.syncWindowGraph(1, {
+      tabs: [
+        {
+          tabId,
+          worktreeId: TEST_WORKTREE_ID,
+          title: 'Recovered',
+          activeLeafId: HEADLESS_LEAF_ID,
+          layout: null,
+          creationOrigin: 'cli',
+          hasEverReceivedExternalInput: true
+        }
+      ],
+      leaves: [
+        {
+          tabId,
+          worktreeId: TEST_WORKTREE_ID,
+          leafId: HEADLESS_LEAF_ID,
+          paneRuntimeId: 1,
+          ptyId: 'pty-replacement'
+        }
+      ]
+    })
+    expect(internals.ptysById.get('pty-replacement')).toMatchObject({
+      creationOrigin: 'cli',
+      hasEverReceivedExternalInput: true
     })
   })
 

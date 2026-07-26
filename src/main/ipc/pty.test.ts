@@ -13161,6 +13161,42 @@ describe('registerPtyHandlers', () => {
     expect(mockProc.proc.write).toHaveBeenNthCalledWith(2, 'tail')
   })
 
+  it('records the first accepted desktop IPC chunk when a later chunk fails', async () => {
+    const mockProc = createMockProc()
+    mockProc.proc.write
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new Error('later chunk failed')
+      })
+    spawnMock.mockReturnValue(mockProc.proc)
+    const recordExternalTerminalInput = vi.fn()
+    registerPtyHandlers(
+      mainWindow as never,
+      {
+        setPtyController: vi.fn(),
+        preAllocateHandleForPty: vi.fn(),
+        onPtySpawned: vi.fn(),
+        onPtyData: vi.fn(),
+        onPtyExit: vi.fn(),
+        getDriver: vi.fn(() => ({ kind: 'desktop' })),
+        recordExternalTerminalInput
+      } as never
+    )
+    const result = (await handlers.get('pty:spawn')!(null, {
+      cols: 80,
+      rows: 24
+    })) as { id: string }
+
+    await expect(
+      handlers.get('pty:writeAccepted')!(mainWindowIpcEvent, {
+        id: result.id,
+        data: 'x'.repeat(TERMINAL_INPUT_CHUNK_MAX_BYTES + 1)
+      })
+    ).resolves.toBe(false)
+
+    expect(recordExternalTerminalInput).toHaveBeenCalledWith(result.id, 'external')
+  })
+
   it('yields while validating accepted large acknowledged pty writes before provider writes', async () => {
     const mockProc = createMockProc()
     spawnMock.mockReturnValue(mockProc.proc)

@@ -62,7 +62,7 @@ export type RemoteRuntimeMultiplexedTerminalCallbacks = {
 
 export type RemoteRuntimeMultiplexedTerminal = {
   streamId: number
-  sendInput: (text: string) => boolean
+  sendInput: (text: string, inputKind?: 'query-reply') => boolean
   resize: (cols: number, rows: number) => boolean
   claimViewport: (cols: number, rows: number) => boolean
   serializeBuffer: (opts?: { scrollbackRows?: number }) => Promise<{
@@ -273,8 +273,19 @@ class RemoteRuntimeTerminalMultiplexer {
 
     const stream: RemoteRuntimeMultiplexedTerminal = {
       streamId,
-      sendInput: (text) =>
-        this.sendFrame(streamId, TerminalStreamOpcode.Input, encodeTerminalStreamText(text)),
+      sendInput: (text, inputKind) => {
+        if (
+          inputKind === 'query-reply' &&
+          !this.sendFrame(
+            streamId,
+            TerminalStreamOpcode.Metadata,
+            encodeTerminalStreamJson({ inputKind })
+          )
+        ) {
+          return false
+        }
+        return this.sendFrame(streamId, TerminalStreamOpcode.Input, encodeTerminalStreamText(text))
+      },
       resize: (cols, rows) =>
         this.sendFrame(
           streamId,

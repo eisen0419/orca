@@ -107,6 +107,13 @@ describe('parseWorkspaceSession', () => {
       sortOrder: z.number(),
       createdAt: z.number()
     })
+    const frozenPreA1WorkspaceSession = z.object({
+      activeRepoId: z.string().nullable(),
+      activeWorktreeId: z.string().nullable(),
+      activeTabId: z.string().nullable(),
+      tabsByWorktree: z.record(z.string(), z.array(frozenPreA1TerminalTab)),
+      terminalLayoutsByTabId: z.record(z.string(), z.unknown())
+    })
     expect(current.ok).toBe(true)
     expect(legacy.ok).toBe(true)
     if (current.ok) {
@@ -121,9 +128,9 @@ describe('parseWorkspaceSession', () => {
         ptyId: 'legacy-pty'
       })
     }
-    expect(
-      frozenPreA1TerminalTab.parse(current.ok ? current.value.tabsByWorktree.wt[0] : null)
-    ).toEqual(expect.objectContaining({ id: 'tab-current', ptyId: null }))
+    expect(frozenPreA1WorkspaceSession.parse(current.ok ? current.value : null)).toMatchObject({
+      tabsByWorktree: { wt: [expect.objectContaining({ id: 'tab-current', ptyId: null })] }
+    })
   })
 
   it('rejects an invalid terminal creation origin without accepting a corrupted session', () => {
