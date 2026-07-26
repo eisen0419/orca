@@ -2817,8 +2817,8 @@ export class OrcaRuntimeService {
   // records can have the same empty maps after a process restart.
   private launchFactsAuthoritativeIncarnationByPtyId = new Map<string, PtyIncarnationId | null>()
   private idleEmptyTerminalReclaimTruncatedCandidateCount = 0
-  // Why: a fixed Map prefix can leave later long-lived PTYs permanently uninspected.
-  private idleEmptyTerminalReclaimCursorPtyId: string | null = null
+  // Why: resuming the Map iterator avoids re-scanning a deleted cursor before the budget starts.
+  private idleEmptyTerminalReclaimCursor: Iterator<RuntimePtyWorktreeRecord> | null = null
   // Why: ordinary OSC 0/1/2 titles can split across PTY chunks, especially over
   // SSH/relay buffering. Keep a small raw scan tail and feed reconstructed
   // chunks into the title tracker instead of falling back to last-title scans.
@@ -3218,41 +3218,26 @@ export class OrcaRuntimeService {
     const ptyCount = this.ptysById.size
     if (ptyCount === 0) {
       this.idleEmptyTerminalReclaimTruncatedCandidateCount = 0
+      this.idleEmptyTerminalReclaimCursor = null
       return []
     }
+    const snapshotDeadline = Date.now() + IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
     const selectedPtys: RuntimePtyWorktreeRecord[] = []
-    const cursorPtyId = this.idleEmptyTerminalReclaimCursorPtyId
-    let cursorFound = cursorPtyId === null
-    for (const pty of this.ptysById.values()) {
-      if (!cursorFound) {
-        cursorFound = pty.ptyId === cursorPtyId
-        continue
+    const selectionLimit = Math.min(IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK, ptyCount)
+    while (
+      selectedPtys.length < selectionLimit &&
+      (selectedPtys.length === 0 || Date.now() < snapshotDeadline)
+    ) {
+      let next = this.idleEmptyTerminalReclaimCursor?.next()
+      if (!next || next.done) {
+        this.idleEmptyTerminalReclaimCursor = this.ptysById.values()
+        next = this.idleEmptyTerminalReclaimCursor.next()
       }
-      selectedPtys.push(pty)
-      if (selectedPtys.length === IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK) {
+      if (next.done) {
         break
       }
+      selectedPtys.push(next.value)
     }
-    if (!cursorFound) {
-      for (const pty of this.ptysById.values()) {
-        selectedPtys.push(pty)
-        if (selectedPtys.length === IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK) {
-          break
-        }
-      }
-    }
-    if (cursorPtyId !== null && cursorFound) {
-      for (const pty of this.ptysById.values()) {
-        if (selectedPtys.length === IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK) {
-          break
-        }
-        selectedPtys.push(pty)
-        if (pty.ptyId === cursorPtyId) {
-          break
-        }
-      }
-    }
-    const snapshotDeadline = Date.now() + IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
     const tick = this.collectIdleEmptyTerminalReclaimTickSnapshot(selectedPtys, snapshotDeadline)
     const snapshots: IdleEmptyTerminalReclaimCandidateSnapshot[] = []
     for (const pty of selectedPtys) {
@@ -3260,7 +3245,6 @@ export class OrcaRuntimeService {
         break
       }
       snapshots.push(this.collectIdleEmptyTerminalReclaimCandidateSnapshot(pty, tick))
-      this.idleEmptyTerminalReclaimCursorPtyId = pty.ptyId
     }
     this.idleEmptyTerminalReclaimTruncatedCandidateCount = ptyCount - snapshots.length
     const candidates = await collectIdleEmptyTerminalReclaimCandidates(
@@ -3271,6 +3255,11 @@ export class OrcaRuntimeService {
       const livePty = candidate.ptyId ? this.ptysById.get(candidate.ptyId) : undefined
       candidate.incarnationId = livePty?.incarnationId ?? null
       candidate.activityGeneration = livePty?.activityGeneration ?? null
+      const ownership = livePty
+        ? this.collectIdleEmptyTerminalReclaimLiveOwnershipFacts(livePty)
+        : { isPersisted: null, rendererOwnsPersistedTab: null }
+      candidate.isPersisted = ownership.isPersisted
+      candidate.rendererOwnsPersistedTab = ownership.rendererOwnsPersistedTab
       candidate.providerConnected =
         candidate.inspection?.status === 'success' &&
         livePty?.connected === true &&
@@ -3286,6 +3275,24 @@ export class OrcaRuntimeService {
             : null
     }
     return candidates
+  }
+
+  private collectIdleEmptyTerminalReclaimLiveOwnershipFacts(pty: RuntimePtyWorktreeRecord) {
+    const deadline = Date.now() + IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS
+    const hasTimeRemaining = (): boolean => Date.now() < deadline
+    const session = hasTimeRemaining() ? this.getWorkspaceSessionForWorktree(pty.worktreeId) : null
+    const persistedBindingIndex =
+      session && hasTimeRemaining()
+        ? indexIdleEmptyTerminalReclaimPersistedBindings(session, hasTimeRemaining)
+        : null
+    return this.collectIdleEmptyTerminalReclaimOwnershipFacts(
+      pty,
+      session,
+      persistedBindingIndex,
+      this.graphStatus === 'ready',
+      this.tabs,
+      this.leaves
+    )
   }
 
   private collectIdleEmptyTerminalReclaimTickSnapshot(
@@ -3525,61 +3532,31 @@ export class OrcaRuntimeService {
     pty: RuntimePtyWorktreeRecord,
     tick: IdleEmptyTerminalReclaimTickSnapshot
   ): IdleEmptyTerminalReclaimCandidateSnapshot {
-    const pane = parsePaneKey(pty.paneKey ?? '')
-    const tabId = pty.tabId ?? pane?.tabId ?? null
-    const leafId = pane?.leafId ?? null
     const session = tick.sessionByWorktreeId.get(pty.worktreeId) ?? null
     const persistedBindingIndex = session ? tick.persistedBindingsBySession.get(session) : undefined
-    const persistedBindings =
-      !persistedBindingIndex || persistedBindingIndex.ambiguousPtyIds.has(pty.ptyId)
-        ? null
-        : (persistedBindingIndex.bindingsByPtyId.get(pty.ptyId) ?? [])
-    const persistedTab = tabId
-      ? session?.tabsByWorktree[pty.worktreeId]?.find((tab) => tab.id === tabId)
-      : undefined
-    const persistedBinding =
-      persistedBindings && tabId && leafId
-        ? persistedBindings.find(
-            (binding) =>
-              binding.tabId === tabId &&
-              binding.leafId === leafId &&
-              binding.worktreeId === pty.worktreeId
-          )
-        : undefined
-    const hasExactPtyPaneBinding =
-      pty.tabId !== null && pty.tabId === pane?.tabId && tabId === pane?.tabId
-    const persistedLayout = tabId ? session?.terminalLayoutsByTabId[tabId] : undefined
-    const hasExactPersistedBinding =
-      Boolean(persistedBinding) && hasExactPtyPaneBinding && persistedBinding?.ptyId === pty.ptyId
-    const isPersisted =
-      persistedBindings === null
-        ? null
-        : persistedBindings.length === 0
-          ? false
-          : hasExactPersistedBinding
-            ? true
-            : null
-
-    const rendererGraphAvailable = this.graphStatus === 'ready'
-    const rendererTab =
-      rendererGraphAvailable && tabId ? tick.rendererTabById.get(tabId) : undefined
-    const rendererLeaf =
-      rendererGraphAvailable && tabId && leafId
-        ? tick.rendererLeafByKey.get(this.getLeafKey(tabId, leafId))
-        : undefined
-    const hasExactRendererBinding =
-      hasExactPtyPaneBinding &&
-      rendererTab?.worktreeId === pty.worktreeId &&
-      rendererLeaf?.worktreeId === pty.worktreeId &&
-      rendererLeaf.ptyId === pty.ptyId
-    const rendererOwnsPersistedTab =
-      !rendererGraphAvailable || isPersisted === null
-        ? null
-        : hasExactRendererBinding
-          ? true
-          : rendererTab === undefined && rendererLeaf === undefined
-            ? false
-            : null
+    const ownership = this.collectIdleEmptyTerminalReclaimOwnershipFacts(
+      pty,
+      session,
+      persistedBindingIndex,
+      this.graphStatus === 'ready',
+      tick.rendererTabById,
+      tick.rendererLeafByKey
+    )
+    const {
+      pane,
+      tabId,
+      leafId,
+      persistedBindings,
+      persistedTab,
+      hasExactPtyPaneBinding,
+      persistedLayout,
+      hasExactPersistedBinding,
+      isPersisted,
+      rendererGraphAvailable,
+      rendererLeaf,
+      hasExactRendererBinding,
+      rendererOwnsPersistedTab
+    } = ownership
     const persistedLeafIds = this.collectPersistedTerminalLeafIds(persistedLayout)
     const rendererLeafCount = tabId ? (tick.rendererLeafCountByTabId?.get(tabId) ?? null) : null
     const isSinglePane =
@@ -3679,6 +3656,82 @@ export class OrcaRuntimeService {
       hasInFlightTransaction: this.collectIdleEmptyTerminalReclaimTransactionFact(pty, tabId, tick),
       hasSecondConfirmation: null,
       hasExactIdentityClaim: null
+    }
+  }
+
+  private collectIdleEmptyTerminalReclaimOwnershipFacts(
+    pty: RuntimePtyWorktreeRecord,
+    session: WorkspaceSessionState | null,
+    persistedBindingIndex: IdleEmptyTerminalReclaimPersistedBindingIndex | undefined | null,
+    rendererGraphAvailable: boolean,
+    rendererTabById: ReadonlyMap<string, RuntimeSyncedTab>,
+    rendererLeafByKey: ReadonlyMap<string, RuntimeLeafRecord>
+  ) {
+    const pane = parsePaneKey(pty.paneKey ?? '')
+    const tabId = pty.tabId ?? pane?.tabId ?? null
+    const leafId = pane?.leafId ?? null
+    const persistedBindings =
+      !persistedBindingIndex || persistedBindingIndex.ambiguousPtyIds.has(pty.ptyId)
+        ? null
+        : (persistedBindingIndex.bindingsByPtyId.get(pty.ptyId) ?? [])
+    const persistedTab = tabId
+      ? session?.tabsByWorktree[pty.worktreeId]?.find((tab) => tab.id === tabId)
+      : undefined
+    const persistedBinding =
+      persistedBindings && tabId && leafId
+        ? persistedBindings.find(
+            (binding) =>
+              binding.tabId === tabId &&
+              binding.leafId === leafId &&
+              binding.worktreeId === pty.worktreeId
+          )
+        : undefined
+    const hasExactPtyPaneBinding =
+      pty.tabId !== null && pty.tabId === pane?.tabId && tabId === pane?.tabId
+    const persistedLayout = tabId ? session?.terminalLayoutsByTabId[tabId] : undefined
+    const hasExactPersistedBinding =
+      Boolean(persistedBinding) && hasExactPtyPaneBinding && persistedBinding?.ptyId === pty.ptyId
+    const isPersisted =
+      persistedBindings === null
+        ? null
+        : persistedBindings.length === 0
+          ? false
+          : hasExactPersistedBinding
+            ? true
+            : null
+    const rendererTab = rendererGraphAvailable && tabId ? rendererTabById.get(tabId) : undefined
+    const rendererLeaf =
+      rendererGraphAvailable && tabId && leafId
+        ? rendererLeafByKey.get(this.getLeafKey(tabId, leafId))
+        : undefined
+    const hasExactRendererBinding =
+      hasExactPtyPaneBinding &&
+      rendererTab?.worktreeId === pty.worktreeId &&
+      rendererLeaf?.worktreeId === pty.worktreeId &&
+      rendererLeaf.ptyId === pty.ptyId
+    const rendererOwnsPersistedTab =
+      !rendererGraphAvailable || isPersisted === null
+        ? null
+        : hasExactRendererBinding
+          ? true
+          : rendererTab === undefined && rendererLeaf === undefined
+            ? false
+            : null
+
+    return {
+      pane,
+      tabId,
+      leafId,
+      persistedBindings,
+      persistedTab,
+      hasExactPtyPaneBinding,
+      persistedLayout,
+      hasExactPersistedBinding,
+      isPersisted,
+      rendererGraphAvailable,
+      rendererLeaf,
+      hasExactRendererBinding,
+      rendererOwnsPersistedTab
     }
   }
 

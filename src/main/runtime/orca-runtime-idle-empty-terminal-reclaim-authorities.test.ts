@@ -42,6 +42,21 @@ type RuntimeIdleReclaimInternals = {
   dropDisconnectedPtyRecord: (ptyId: string) => void
 }
 
+function configurePtyController(
+  runtime: OrcaRuntimeService,
+  inspectProcess: (
+    ptyId: string
+  ) => Promise<{ foregroundProcess: string; hasChildProcesses: boolean }>
+) {
+  runtime.setPtyController({
+    spawn: vi.fn(),
+    write: vi.fn(() => true),
+    kill: vi.fn(() => true),
+    getForegroundProcess: vi.fn(async () => 'zsh'),
+    inspectProcess
+  })
+}
+
 function makeStore(enabled: boolean, session: WorkspaceSessionState | null = null) {
   return {
     getSettings: () => ({
@@ -531,6 +546,174 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
       hasResumeProviderSession: null,
       hasLaunchAgent: null
     })
+    runtime.dispose()
+  })
+
+  it('reconfirms a persisted binding that appears during inspection before classifying', async () => {
+    const session = getDefaultWorkspaceSession()
+    session.tabsByWorktree[WORKTREE_ID] = []
+    let resolveInspection!: (value: {
+      foregroundProcess: string
+      hasChildProcesses: boolean
+    }) => void
+    const runtime = new OrcaRuntimeService({
+      ...makeStore(true),
+      getWorkspaceSession: () => session
+    } as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    const inspectProcess = vi.fn(
+      () =>
+        new Promise<{ foregroundProcess: string; hasChildProcesses: boolean }>((resolve) => {
+          resolveInspection = resolve
+        })
+    )
+    configurePtyController(runtime, inspectProcess)
+    const pty = internals.recordPtyWorktree('pty-persisted-during-inspection', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'persisted-during-inspection',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    const pendingCandidate = internals.collectIdleEmptyTerminalReclaimCandidates()
+    await vi.waitFor(() => expect(inspectProcess).toHaveBeenCalledOnce())
+    session.tabsByWorktree[WORKTREE_ID] = [
+      { ...persistedTerminalTab(), id: HOT_TAB_ID, ptyId: pty.ptyId }
+    ]
+    session.terminalLayoutsByTabId[HOT_TAB_ID] = {
+      root: { type: 'leaf', leafId: HOT_LEAF_ID },
+      activeLeafId: HOT_LEAF_ID,
+      expandedLeafId: null,
+      ptyIdsByLeafId: { [HOT_LEAF_ID]: pty.ptyId }
+    }
+    resolveInspection({ foregroundProcess: 'zsh', hasChildProcesses: false })
+    const [candidate] = await pendingCandidate
+
+    expect(candidate).toMatchObject({ isPersisted: true, rendererOwnsPersistedTab: false })
+    expect(
+      evaluateIdleReclaimCandidate(
+        {
+          ...fullyEligibleCandidate(),
+          isPersisted: candidate?.isPersisted ?? null,
+          rendererOwnsPersistedTab: candidate?.rendererOwnsPersistedTab ?? null
+        },
+        { enabled: true },
+        60 * 60 * 1000
+      )
+    ).toEqual({ eligible: true, closeMode: 'runtime-owned-persisted' })
+    runtime.dispose()
+  })
+
+  it('reconfirms renderer ownership that appears during inspection before classifying', async () => {
+    const session = getDefaultWorkspaceSession()
+    session.tabsByWorktree[WORKTREE_ID] = []
+    let resolveInspection!: (value: {
+      foregroundProcess: string
+      hasChildProcesses: boolean
+    }) => void
+    const runtime = new OrcaRuntimeService({
+      ...makeStore(true),
+      getWorkspaceSession: () => session
+    } as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    const inspectProcess = vi.fn(
+      () =>
+        new Promise<{ foregroundProcess: string; hasChildProcesses: boolean }>((resolve) => {
+          resolveInspection = resolve
+        })
+    )
+    configurePtyController(runtime, inspectProcess)
+    const pty = internals.recordPtyWorktree('pty-renderer-during-inspection', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'renderer-during-inspection',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    const pendingCandidate = internals.collectIdleEmptyTerminalReclaimCandidates()
+    await vi.waitFor(() => expect(inspectProcess).toHaveBeenCalledOnce())
+    internals.tabs.set(HOT_TAB_ID, {
+      tabId: HOT_TAB_ID,
+      worktreeId: WORKTREE_ID,
+      title: null,
+      activeLeafId: HOT_LEAF_ID,
+      layout: { type: 'leaf', leafId: HOT_LEAF_ID }
+    })
+    internals.leaves.set(`${HOT_TAB_ID}::${HOT_LEAF_ID}`, {
+      tabId: HOT_TAB_ID,
+      leafId: HOT_LEAF_ID,
+      worktreeId: WORKTREE_ID,
+      ptyId: pty.ptyId,
+      writable: true
+    })
+    resolveInspection({ foregroundProcess: 'zsh', hasChildProcesses: false })
+    const [candidate] = await pendingCandidate
+
+    expect(candidate).toMatchObject({ isPersisted: false, rendererOwnsPersistedTab: true })
+    expect(
+      evaluateIdleReclaimCandidate(
+        {
+          ...fullyEligibleCandidate(),
+          isPersisted: candidate?.isPersisted ?? null,
+          rendererOwnsPersistedTab: candidate?.rendererOwnsPersistedTab ?? null
+        },
+        { enabled: true },
+        60 * 60 * 1000
+      )
+    ).toEqual({ eligible: false, reason: 'topology-or-binding-invalid' })
+    runtime.dispose()
+  })
+
+  it('degrades ownership to null when its session authority becomes unreadable during inspection', async () => {
+    let session: WorkspaceSessionState | null = getDefaultWorkspaceSession()
+    session.tabsByWorktree[WORKTREE_ID] = []
+    let resolveInspection!: (value: {
+      foregroundProcess: string
+      hasChildProcesses: boolean
+    }) => void
+    const runtime = new OrcaRuntimeService({
+      ...makeStore(true),
+      getWorkspaceSession: () => session
+    } as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals
+    internals.graphStatus = 'ready'
+    const inspectProcess = vi.fn(
+      () =>
+        new Promise<{ foregroundProcess: string; hasChildProcesses: boolean }>((resolve) => {
+          resolveInspection = resolve
+        })
+    )
+    configurePtyController(runtime, inspectProcess)
+    const pty = internals.recordPtyWorktree('pty-session-unreadable', WORKTREE_ID, {
+      connected: true,
+      incarnationId: 'session-unreadable',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    const pendingCandidate = internals.collectIdleEmptyTerminalReclaimCandidates()
+    await vi.waitFor(() => expect(inspectProcess).toHaveBeenCalledOnce())
+    session = null
+    resolveInspection({ foregroundProcess: 'zsh', hasChildProcesses: false })
+    const [candidate] = await pendingCandidate
+
+    expect(candidate).toMatchObject({ isPersisted: null, rendererOwnsPersistedTab: null })
+    expect(
+      evaluateIdleReclaimCandidate(
+        {
+          ...fullyEligibleCandidate(),
+          isPersisted: candidate?.isPersisted ?? null,
+          rendererOwnsPersistedTab: candidate?.rendererOwnsPersistedTab ?? null
+        },
+        { enabled: true },
+        60 * 60 * 1000
+      )
+    ).toEqual({ eligible: false, reason: 'topology-or-binding-invalid' })
     runtime.dispose()
   })
 
