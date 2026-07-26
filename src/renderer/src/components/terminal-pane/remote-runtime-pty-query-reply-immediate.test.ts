@@ -121,7 +121,7 @@ describe('remote transport sendInputImmediate (#7329)', () => {
     }
   })
 
-  it('requeues pending typed input when the immediate RPC send fails', async () => {
+  it('requeues a rejected pure reply with its query-reply kind', async () => {
     vi.useFakeTimers()
     try {
       let rejectFirstSend = true
@@ -157,13 +157,76 @@ describe('remote transport sendInputImmediate (#7329)', () => {
       })
       await vi.waitFor(() => expect(runtimeSubscribe).toHaveBeenCalled())
 
-      expect(transport.sendInput('typed')).toBe(true)
       expect(transport.sendInputImmediate('\x1b[3;1R')).toBe(true)
       await Promise.resolve()
       await vi.advanceTimersByTimeAsync(8)
 
-      const sends = terminalSendCalls() as { params: { text: string } }[]
-      expect(sends.map((send) => send.params.text)).toEqual(['typed\x1b[3;1R', 'typed\x1b[3;1R'])
+      const sends = terminalSendCalls() as { params: { text: string; inputKind?: string } }[]
+      expect(sends).toEqual([
+        expect.objectContaining({
+          params: expect.objectContaining({ text: '\x1b[3;1R', inputKind: 'query-reply' })
+        }),
+        expect.objectContaining({
+          params: expect.objectContaining({ text: '\x1b[3;1R', inputKind: 'query-reply' })
+        })
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not let a keystroke overtake an unresolved immediate reply RPC', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveFirst!: (value: unknown) => void
+      runtimeCall.mockImplementation((request: { method?: string }) => {
+        if (request.method === 'terminal.send' && !resolveFirst) {
+          return new Promise((resolve) => {
+            resolveFirst = resolve
+          })
+        }
+        if (request.method === 'terminal.send') {
+          return Promise.resolve({
+            ok: true,
+            result: { send: { handle: 'terminal-1', accepted: true, bytesWritten: 1 } }
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          result: {
+            terminal: { handle: 'terminal-1', tabId: 'tab-1', leafId: 'pane:1', worktreeId: 'wt-1' }
+          }
+        })
+      })
+      const { createRemoteRuntimePtyTransport } = await import('./remote-runtime-pty-transport')
+      const transport = createRemoteRuntimePtyTransport('env-1', {
+        worktreeId: 'wt-1',
+        tabId: 'tab-1',
+        leafId: 'pane:1'
+      })
+      transport.attach({
+        existingPtyId: 'remote:env-1@@terminal-1',
+        cols: 80,
+        rows: 24,
+        callbacks: {}
+      })
+      await vi.waitFor(() => expect(runtimeSubscribe).toHaveBeenCalled())
+
+      expect(transport.sendInputImmediate('\x1b[3;1R')).toBe(true)
+      expect(transport.sendInput('typed')).toBe(true)
+      await vi.advanceTimersByTimeAsync(8)
+      expect(
+        (terminalSendCalls() as { params: { text: string } }[]).map((call) => call.params.text)
+      ).toEqual(['\x1b[3;1R'])
+
+      resolveFirst({
+        ok: true,
+        result: { send: { handle: 'terminal-1', accepted: true, bytesWritten: 1 } }
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(
+        (terminalSendCalls() as { params: { text: string } }[]).map((call) => call.params.text)
+      ).toEqual(['\x1b[3;1R', 'typed'])
     } finally {
       vi.useRealTimers()
     }

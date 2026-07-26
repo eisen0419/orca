@@ -3799,6 +3799,7 @@ export class Store {
     const { payload, stateHash } = this.buildStateToSave()
     // Why: don't rewrite a byte-identical multi-MB file when state nets out to already-persisted.
     if (stateHash === this.lastWrittenStateHash) {
+      this.terminalExternalInputPersistenceDirty = false
       return
     }
     const dataFile = this.dataFile
@@ -3819,6 +3820,7 @@ export class Store {
       // Why re-check gen: a sync flush during the rename await may have written fresher state; don't record a stale hash over it.
       if (this.writeGeneration === gen) {
         this.lastWrittenStateHash = stateHash
+        this.terminalExternalInputPersistenceDirty = false
       }
     } finally {
       if (!renamed) {
@@ -6518,6 +6520,7 @@ export class Store {
     ) {
       return
     }
+    const retryWasAlreadyDirty = this.terminalExternalInputPersistenceDirty
     tab.hasEverReceivedExternalInput = true
     this.terminalExternalInputPersistenceDirty = true
     if (resolvedHostId !== LOCAL_EXECUTION_HOST_ID) {
@@ -6525,6 +6528,11 @@ export class Store {
         ...this.state.workspaceSessionsByHostId,
         [resolvedHostId]: session
       }
+    }
+    if (retryWasAlreadyDirty) {
+      // Why: a persistent disk failure must not rebuild the full Store for every terminal keystroke.
+      this.scheduleSave()
+      return
     }
     try {
       this.flushOrThrow()

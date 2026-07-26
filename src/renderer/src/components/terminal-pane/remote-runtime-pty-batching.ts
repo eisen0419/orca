@@ -7,14 +7,14 @@ import {
 } from '../../../../shared/terminal-input'
 
 export type RemoteRuntimePtyBatcher = {
-  push: (data: string) => boolean
-  hasPendingValidation: () => boolean
+  push: (data: string, inputKind?: RemoteRuntimePtyInputKind) => boolean
   drain: () => Promise<void>
   takePending: () => string
-  restorePending: (data: string) => void
   flush: () => void
   clear: () => void
 }
+
+export type RemoteRuntimePtyInputKind = 'external' | 'query-reply'
 
 export type RemoteRuntimeViewportBatcher = {
   queue: (cols: number, rows: number) => void
@@ -33,7 +33,7 @@ export const REMOTE_RUNTIME_PTY_VALIDATION_QUEUE_MAX_ENTRIES = 4_096
 
 export function createRemoteRuntimePtyTextBatcher(
   delayMs: number,
-  onFlush: (text: string) => void,
+  onFlush: (text: string, inputKind: RemoteRuntimePtyInputKind) => unknown,
   options: RemoteRuntimePtyTextBatcherOptions = {}
 ): RemoteRuntimePtyBatcher {
   const maxPendingBytes = getPositiveByteLimit(
@@ -49,9 +49,12 @@ export function createRemoteRuntimePtyTextBatcher(
     options.maxValidationQueuedEntries,
     REMOTE_RUNTIME_PTY_VALIDATION_QUEUE_MAX_ENTRIES
   )
-  let pending = ''
+  let pending: { text: string; inputKind: RemoteRuntimePtyInputKind }[] = []
   let pendingBytes = 0
   let timer: ReturnType<typeof setTimeout> | null = null
+  let inFlight: Promise<void> | null = null
+  let flushRequestedWhileInFlight = false
+  let pendingVersion = 0
   let validationTail: Promise<void> | null = null
   let validationVersion = 0
   let validationQueuedCodeUnits = 0
@@ -66,8 +69,10 @@ export function createRemoteRuntimePtyTextBatcher(
 
   const clear = (): void => {
     clearTimer()
-    pending = ''
+    pending = []
     pendingBytes = 0
+    pendingVersion += 1
+    flushRequestedWhileInFlight = false
     validationVersion += 1
     validationTail = null
     validationQueuedCodeUnits = 0
@@ -75,57 +80,139 @@ export function createRemoteRuntimePtyTextBatcher(
   }
 
   const flush = (): void => {
-    const text = takePending()
-    if (text) {
-      onFlush(text)
+    clearTimer()
+    if (inFlight) {
+      flushRequestedWhileInFlight = true
+      return
+    }
+    const entries = takePendingEntries()
+    if (entries.length === 0) {
+      return
+    }
+    const text = entries.map((entry) => entry.text).join('')
+    const inputKind = entries.some((entry) => entry.inputKind === 'external')
+      ? 'external'
+      : 'query-reply'
+    const version = pendingVersion
+    let result: unknown
+    try {
+      result = onFlush(text, inputKind)
+    } catch {
+      restorePendingEntries(entries, version)
+      return
+    }
+    if (!isPromiseLike(result)) {
+      if (result === false) {
+        restorePendingEntries(entries, version)
+      }
+      return
+    }
+    const currentFlight = Promise.resolve(result)
+      .then((accepted) => {
+        if (accepted === false) {
+          restorePendingEntries(entries, version)
+        }
+      })
+      .catch(() => {
+        restorePendingEntries(entries, version)
+      })
+      .finally(() => {
+        if (inFlight !== currentFlight) {
+          return
+        }
+        inFlight = null
+        if (flushRequestedWhileInFlight) {
+          flushRequestedWhileInFlight = false
+          flush()
+        }
+      })
+    inFlight = currentFlight
+    if (pending.length > 0) {
+      flushRequestedWhileInFlight = true
     }
   }
 
   const takePending = (): string => {
-    const text = pending
-    pending = ''
+    const text = pending.map((entry) => entry.text).join('')
+    pending = []
     pendingBytes = 0
     clearTimer()
     return text
   }
 
-  const restorePending = (data: string): void => {
-    if (!data) {
+  const takePendingEntries = (): { text: string; inputKind: RemoteRuntimePtyInputKind }[] => {
+    const entries: { text: string; inputKind: RemoteRuntimePtyInputKind }[] = []
+    let batchBytes = 0
+    while (pending.length > 0) {
+      const next = pending[0]!
+      const nextBytes = getTerminalInputByteLength(next.text)
+      if (entries.length > 0 && batchBytes + nextBytes > maxPendingBytes) {
+        break
+      }
+      entries.push(next)
+      pending.shift()
+      pendingBytes -= nextBytes
+      batchBytes += nextBytes
+    }
+    clearTimer()
+    return entries
+  }
+
+  const restorePendingEntries = (
+    entries: { text: string; inputKind: RemoteRuntimePtyInputKind }[],
+    version: number
+  ): void => {
+    if (entries.length === 0 || pendingVersion !== version) {
       return
     }
-    // Why: an immediate RPC can fail after taking queued keystrokes; restore at the front so later input cannot overtake them.
-    pending = data + pending
-    pendingBytes += getTerminalInputByteLength(data)
+    pending = [...entries, ...pending]
+    pendingBytes += entries.reduce(
+      (total, entry) => total + getTerminalInputByteLength(entry.text),
+      0
+    )
     if (!timer) {
       timer = setTimeout(flush, delayMs)
     }
   }
 
-  const queuePending = (chunk: string, chunkBytes: number): void => {
-    pending += chunk
+  const queuePending = (
+    chunk: string,
+    chunkBytes: number,
+    inputKind: RemoteRuntimePtyInputKind
+  ): void => {
+    const previous = pending.at(-1)
+    if (
+      previous?.inputKind === inputKind &&
+      getTerminalInputByteLength(previous.text) + chunkBytes <= maxPendingBytes
+    ) {
+      previous.text += chunk
+    } else {
+      pending.push({ text: chunk, inputKind })
+    }
     pendingBytes += chunkBytes
     if (!timer) {
       timer = setTimeout(flush, delayMs)
     }
   }
 
-  const pushValidatedInput = (data: string): void => {
+  const pushValidatedInput = (data: string, inputKind: RemoteRuntimePtyInputKind): void => {
     for (const chunk of iterateTerminalInputChunks(data, maxPendingBytes)) {
       const chunkBytes = getTerminalInputByteLength(chunk)
-      if (pending && pendingBytes + chunkBytes > maxPendingBytes) {
+      if (pending.length > 0 && pendingBytes + chunkBytes > maxPendingBytes) {
         flush()
       }
-      if (!pending && chunkBytes >= maxPendingBytes) {
-        // Why: remote paste chunks must not be coalesced back into one large
-        // binary frame or terminal.send payload by the short input debounce.
-        onFlush(chunk)
-        continue
+      queuePending(chunk, chunkBytes, inputKind)
+      if (chunkBytes >= maxPendingBytes) {
+        flush()
       }
-      queuePending(chunk, chunkBytes)
     }
   }
 
-  const enqueueValidatedInput = (data: string, tooLarge: false | Promise<boolean>): boolean => {
+  const enqueueValidatedInput = (
+    data: string,
+    inputKind: RemoteRuntimePtyInputKind,
+    tooLarge: false | Promise<boolean>
+  ): boolean => {
     if (
       validationQueuedEntries >= maxValidationQueuedEntries ||
       validationQueuedCodeUnits + data.length > maxValidationQueuedCodeUnits
@@ -144,7 +231,7 @@ export function createRemoteRuntimePtyTextBatcher(
         return
       }
       if (validationVersion === queuedVersion) {
-        pushValidatedInput(data)
+        pushValidatedInput(data, inputKind)
       }
     })
     const nextTail = guardedTail
@@ -170,7 +257,7 @@ export function createRemoteRuntimePtyTextBatcher(
   }
 
   return {
-    push(data: string): boolean {
+    push(data: string, inputKind: RemoteRuntimePtyInputKind = 'external'): boolean {
       if (!data) {
         return true
       }
@@ -181,22 +268,21 @@ export function createRemoteRuntimePtyTextBatcher(
       }
 
       if (tooLarge === false && validationTail === null) {
-        pushValidatedInput(data)
+        pushValidatedInput(data, inputKind)
         return true
       }
 
-      return enqueueValidatedInput(data, tooLarge)
+      return enqueueValidatedInput(data, inputKind, tooLarge)
     },
-    // Why: earlier input can be mid async byte-length validation and not yet in
-    // `pending`. `takePending()` cannot see it, so callers that must preserve
-    // byte order (sendInputImmediate) check this before bypassing the queue.
-    hasPendingValidation: (): boolean => validationTail !== null,
     drain,
     takePending,
-    restorePending,
     flush,
     clear
   }
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return typeof (value as { then?: unknown } | null | undefined)?.then === 'function'
 }
 
 function getPositiveByteLimit(value: number | undefined, fallback: number): number {
@@ -215,8 +301,6 @@ export function createRemoteRuntimeViewportBatcher(
       clearTimeout(timer)
       timer = null
     }
-    // Why: also drop the queued viewport so a later flush()/reuse can't emit a
-    // stale resize after the batcher was cleared on teardown/resubscribe.
     pending = null
   }
 

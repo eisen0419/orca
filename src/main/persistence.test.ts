@@ -4947,26 +4947,44 @@ describe('Store', () => {
     })
   })
 
-  it('keeps accepted terminal input hot and retries its persistence after a transient flush failure', async () => {
+  it('keeps accepted terminal input hot and gates a dirty persistence retry behind the save cadence', async () => {
     const store = await createStore()
-    store.persistPtyBinding({
-      worktreeId: 'wt-flush-retry',
-      tabId: 'tab-flush-retry',
-      leafId: TEST_LEAF_1,
-      ptyId: 'flush-retry-pty'
-    })
-    const flush = vi.spyOn(store, 'flushOrThrow')
-    flush.mockImplementationOnce(() => {
-      throw new Error('transient disk failure')
-    })
+    vi.useFakeTimers()
+    try {
+      store.persistPtyBinding({
+        worktreeId: 'wt-flush-retry',
+        tabId: 'tab-flush-retry',
+        leafId: TEST_LEAF_1,
+        ptyId: 'flush-retry-pty'
+      })
+      const flush = vi.spyOn(store, 'flushOrThrow')
+      const deferredWrite = vi.spyOn(
+        store as unknown as { writeToDiskAsync: () => Promise<void> },
+        'writeToDiskAsync'
+      )
+      flush.mockImplementationOnce(() => {
+        throw new Error('transient disk failure')
+      })
 
-    expect(() => store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')).not.toThrow()
-    expect(store.getWorkspaceSession().tabsByWorktree['wt-flush-retry']?.[0]).toMatchObject({
-      hasEverReceivedExternalInput: true
-    })
+      expect(() =>
+        store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')
+      ).not.toThrow()
+      expect(store.getWorkspaceSession().tabsByWorktree['wt-flush-retry']?.[0]).toMatchObject({
+        hasEverReceivedExternalInput: true
+      })
 
-    store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')
-    expect(flush).toHaveBeenCalledTimes(2)
+      store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')
+      expect(flush).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(999)
+      expect(deferredWrite).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(deferredWrite).toHaveBeenCalledOnce()
+      store.markTerminalExternalInput('wt-flush-retry', 'tab-flush-retry')
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(deferredWrite).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('does not let a stale renderer session clear persisted terminal input', async () => {

@@ -965,29 +965,36 @@ export function createRemoteRuntimePtyTransport(
     }
   }
 
-  const inputBatcher = createRemoteRuntimePtyTextBatcher(REMOTE_TERMINAL_INPUT_FLUSH_MS, (text) => {
-    const targetHandle = handle
-    if (!connected || !targetHandle || recoveryBlocksIo()) {
-      return
+  const inputBatcher = createRemoteRuntimePtyTextBatcher(
+    REMOTE_TERMINAL_INPUT_FLUSH_MS,
+    async (text, inputKind) => {
+      const targetHandle = handle
+      if (!connected || !targetHandle || recoveryBlocksIo()) {
+        return true
+      }
+      const stream = getCurrentMultiplexedStream(targetHandle)
+      if (stream?.sendInput(text, inputKind === 'query-reply' ? inputKind : undefined)) {
+        return true
+      }
+      if (pendingViewportClaim) {
+        // Why: a claim during subscribe/reconnect has no stream record yet; hold its input so the stream emits claim+input in one order.
+        return pendingClaimInput.append(text, inputKind)
+      }
+      try {
+        const result = await callRuntime<{ send: RuntimeTerminalSend }>('terminal.send', {
+          terminal: targetHandle,
+          text,
+          ...(inputKind === 'query-reply' ? { inputKind } : {}),
+          client: { id: clientId, type: 'desktop' },
+          ...(desiredViewport ? { viewport: desiredViewport, claimViewport: true as const } : {})
+        })
+        return result.send.accepted === true
+      } catch (error) {
+        handleRemoteTerminalError(error)
+        return false
+      }
     }
-    const stream = getCurrentMultiplexedStream(targetHandle)
-    if (stream?.sendInput(text)) {
-      return
-    }
-    if (pendingViewportClaim) {
-      // Why: a claim during subscribe/reconnect has no stream record yet; hold its input so the stream emits claim+input in one order.
-      pendingClaimInput.append(text)
-      return
-    }
-    void callRuntime('terminal.send', {
-      terminal: targetHandle,
-      text,
-      client: { id: clientId, type: 'desktop' },
-      ...(desiredViewport ? { viewport: desiredViewport, claimViewport: true as const } : {})
-    }).catch((error) => {
-      handleRemoteTerminalError(error)
-    })
-  })
+  )
 
   function sendViewportUpdate(cols: number, rows: number, claim = false): void {
     const targetHandle = handle
@@ -1852,39 +1859,10 @@ export function createRemoteRuntimePtyTransport(
       if (!data) {
         return true
       }
-      // Why: earlier input may still be in async byte-length validation (in validationTail, not takePending); route the reply through the ordered queue so it can't jump ahead and reorder bytes.
-      if (inputBatcher.hasPendingValidation()) {
-        const accepted = inputBatcher.push(data)
-        inputBatcher.flush()
-        return accepted
-      }
-      const pending = inputBatcher.takePending()
-      const text = `${pending}${data}`
-      const inputKind = pending ? undefined : 'query-reply'
-      const stream = getCurrentMultiplexedStream(targetHandle)
-      if (stream?.sendInput(text, inputKind)) {
-        return true
-      }
-      if (pendingViewportClaim) {
-        return pendingClaimInput.append(text, inputKind ?? 'external')
-      }
-      void callRuntime<{ send: RuntimeTerminalSend }>('terminal.send', {
-        terminal: targetHandle,
-        text,
-        ...(inputKind ? { inputKind } : {}),
-        client: { id: clientId, type: 'desktop' },
-        ...(desiredViewport ? { viewport: desiredViewport, claimViewport: true as const } : {})
-      })
-        .then((result: { send: RuntimeTerminalSend }) => {
-          if (result.send.accepted !== true) {
-            inputBatcher.restorePending(text)
-          }
-        })
-        .catch((error) => {
-          inputBatcher.restorePending(text)
-          handleRemoteTerminalError(error)
-        })
-      return true
+      // Why: query replies must bypass the debounce without bypassing ordered batch delivery.
+      const accepted = inputBatcher.push(data, 'query-reply')
+      inputBatcher.flush()
+      return accepted
     },
 
     sendInputAccepted: sendInputAcceptedToRuntime,

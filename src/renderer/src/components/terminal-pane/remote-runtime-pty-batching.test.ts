@@ -27,6 +27,58 @@ describe('createRemoteRuntimePtyTextBatcher', () => {
     }
   })
 
+  it('keeps a pure query reply tagged while classifying a mixed batch as external', () => {
+    const flushes: { text: string; inputKind: string }[] = []
+    const batcher = createRemoteRuntimePtyTextBatcher(10, (text, inputKind) => {
+      flushes.push({ text, inputKind })
+    })
+
+    expect(batcher.push('\x1b[3;1R', 'query-reply')).toBe(true)
+    expect(batcher.push('\x1b[4;1R', 'query-reply')).toBe(true)
+    batcher.flush()
+    expect(flushes).toEqual([{ text: '\x1b[3;1R\x1b[4;1R', inputKind: 'query-reply' }])
+
+    expect(batcher.push('\x1b[5;1R', 'query-reply')).toBe(true)
+    expect(batcher.push('typed')).toBe(true)
+    batcher.flush()
+    expect(flushes[1]).toEqual({ text: '\x1b[5;1Rtyped', inputKind: 'external' })
+  })
+
+  it('requeues a rejected query reply with its kind and fences later input behind it', async () => {
+    vi.useFakeTimers()
+    try {
+      const flushes: { text: string; inputKind: string }[] = []
+      let finishFirst!: (accepted: boolean) => void
+      const batcher = createRemoteRuntimePtyTextBatcher(10, (text, inputKind) => {
+        flushes.push({ text, inputKind })
+        if (flushes.length === 1) {
+          return new Promise<boolean>((resolve) => {
+            finishFirst = resolve
+          })
+        }
+        return true
+      })
+
+      expect(batcher.push('\x1b[3;1R', 'query-reply')).toBe(true)
+      batcher.flush()
+      expect(batcher.push('typed')).toBe(true)
+      batcher.flush()
+      expect(flushes).toEqual([{ text: '\x1b[3;1R', inputKind: 'query-reply' }])
+
+      finishFirst(false)
+      await vi.advanceTimersByTimeAsync(0)
+
+      // The queued keypress requested a flush while the reply was unresolved,
+      // so failure resumes the reply ahead of it instead of allowing overtaking.
+      expect(flushes).toEqual([
+        { text: '\x1b[3;1R', inputKind: 'query-reply' },
+        { text: '\x1b[3;1Rtyped', inputKind: 'external' }
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('flushes before pending input exceeds the byte ceiling', () => {
     const flushes: string[] = []
     const batcher = createRemoteRuntimePtyTextBatcher(10, (text) => flushes.push(text), {

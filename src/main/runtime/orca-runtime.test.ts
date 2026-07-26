@@ -2646,6 +2646,13 @@ describe('OrcaRuntimeService', () => {
   it('recovers a disconnected pane through one HUB-owned replacement', async () => {
     const tabId = 'tab-recover'
     const runtime = createRuntimeWithSshLease('pty-expired', tabId)
+    const spawn = vi.fn().mockResolvedValue({ id: 'pty-replacement' })
+    runtime.setPtyController({
+      spawn,
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
     const paneKey = makePaneKey(tabId, HEADLESS_LEAF_ID)
     runtime.registerPty('pty-expired', TEST_WORKTREE_ID, null, {
       tabId,
@@ -2665,35 +2672,27 @@ describe('OrcaRuntimeService', () => {
     expiredPty.hasEverReceivedExternalInput = true
     const expiredHandle = runtime.resolveTerminalPane(paneKey, TEST_WORKTREE_ID).handle
     runtime.onPtyExit('pty-expired', 0)
-    const createTerminal = vi.spyOn(runtime, 'createTerminal').mockResolvedValue({
-      handle: 'term-replacement',
-      tabId,
-      paneKey,
-      ptyId: 'pty-replacement',
-      worktreeId: TEST_WORKTREE_ID,
-      title: null,
-      surface: 'background'
-    })
 
-    await expect(
-      runtime.recoverTerminalPane(paneKey, TEST_WORKTREE_ID, expiredHandle)
-    ).resolves.toMatchObject({
-      handle: 'term-replacement',
+    const recovery = runtime.recoverTerminalPane(paneKey, TEST_WORKTREE_ID, expiredHandle)
+    await expect(recovery).resolves.toMatchObject({
       tabId,
       leafId: HEADLESS_LEAF_ID,
       worktreeId: TEST_WORKTREE_ID
     })
-    expect(createTerminal).toHaveBeenCalledWith(`id:${TEST_WORKTREE_ID}`, {
-      tabId,
-      leafId: HEADLESS_LEAF_ID,
-      focus: false,
+    const recovered = await recovery
+    expect(spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        creationOrigin: 'cli',
+        hasEverReceivedExternalInput: true,
+        tabId,
+        leafId: HEADLESS_LEAF_ID
+      })
+    )
+    expect(recovered.ptyId).toBe('pty-replacement')
+    // Why: this hot record is created by real createTerminal, before any renderer graph can supply provenance.
+    expect(internals.ptysById.get('pty-replacement')).toMatchObject({
       creationOrigin: 'cli',
-      hasEverReceivedExternalInput: true,
-      persistHostSessionBinding: true
-    })
-    runtime.registerPty('pty-replacement', TEST_WORKTREE_ID, null, {
-      tabId,
-      leafId: HEADLESS_LEAF_ID
+      hasEverReceivedExternalInput: true
     })
     runtime.syncWindowGraph(1, {
       tabs: [
