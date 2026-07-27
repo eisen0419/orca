@@ -1,203 +1,41 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { join } from 'node:path'
-import type { AgentStatusIpcPayload } from '../../shared/agent-status-types'
-import { getDefaultWorkspaceSession } from '../../shared/constants'
-import type { RuntimeMobileSessionTabsSnapshot } from '../../shared/runtime-types'
-import type { WorkspaceSessionState } from '../../shared/types'
+import { evaluateIdleReclaimCandidate } from './idle-empty-terminal-reclaim'
 import {
-  evaluateIdleReclaimCandidate,
-  type IdleEmptyTerminalReclaimCandidate
-} from './idle-empty-terminal-reclaim'
-import { OrcaRuntimeService } from './orca-runtime'
-
-const WORKTREE_ID = 'worktree-1'
-const HOT_TAB_ID = '55555555-5555-4555-8555-555555555555'
-const HOT_LEAF_ID = '66666666-6666-4666-8666-666666666666'
-const HOT_PANE_KEY = `${HOT_TAB_ID}:${HOT_LEAF_ID}`
-const HOT_PTY_ID = 'pty-hot'
-const HOT_INCARNATION_ID = 'hot-incarnation'
-const WORKSPACE_DIR = join(process.cwd(), 'idle-empty-terminal-reclaim-fixture')
-
-type RuntimeIdleReclaimInternals = {
-  graphStatus: 'unavailable' | 'reloading' | 'ready'
-  tabs: Map<
-    string,
-    { tabId: string; worktreeId: string; rendererVisibility?: 'hidden' | 'visible' }
-  >
-  mobileSessionTabsByWorktree: Map<string, RuntimeMobileSessionTabsSnapshot>
-  ptysById: Map<string, unknown>
-  leaves: Map<string, unknown>
-  handleByPtyId: Map<string, string>
-  handles: Map<string, unknown>
-  reclaimInFlightByPtyId: Map<string, unknown>
-  launchFactsAuthoritativeIncarnationByPtyId: Map<string, string | null>
-  removePersistedHeadlessTerminalTab: (...args: unknown[]) => string[]
-  closeHeadlessMobileTerminalTab: (...args: unknown[]) => Promise<void>
-  recordPtyWorktree: (
-    ptyId: string,
-    worktreeId: string,
-    state?: { connected?: boolean; incarnationId?: string; tabId?: string; paneKey?: string }
-  ) => {
-    ptyId: string
-    incarnationId: string | null
-    activityGeneration: number
-    creationOrigin: 'user' | 'cli' | 'orchestration' | null
-    lastActivityAt: number
-  }
-  collectIdleEmptyTerminalReclaimCandidates: () => Promise<IdleEmptyTerminalReclaimCandidate[]>
-  rebuildLeafPtyIndex: () => void
-  tickIdleEmptyTerminalReclaim: () => Promise<void>
-  collectIdleEmptyTerminalReclaimConfirmation: (
-    candidate: IdleEmptyTerminalReclaimCandidate
-  ) => Promise<IdleEmptyTerminalReclaimCandidate | null>
-  reclaimHotOnlyIdleTerminal: (
-    candidate: IdleEmptyTerminalReclaimCandidate,
-    config: { enabled?: unknown; idleThresholdMs?: unknown }
-  ) => Promise<{
-    decision: ReturnType<typeof evaluateIdleReclaimCandidate>
-    reclaimed: boolean
-  } | null>
-  retireHotOnlyIdleTerminal: (
-    candidate: IdleEmptyTerminalReclaimCandidate,
-    claim: { incarnationId: string; activityGeneration: number }
-  ) => Promise<boolean>
-}
-
-function makeStore(session: WorkspaceSessionState) {
-  return {
-    getSettings: () => ({
-      workspaceDir: WORKSPACE_DIR,
-      nestWorkspaces: false,
-      refreshLocalBaseRefOnWorktreeCreate: false,
-      branchPrefix: '',
-      branchPrefixCustom: '',
-      terminalIdleEmptyReclaimEnabled: true,
-      terminalIdleEmptyReclaimMs: 5 * 60 * 1000
-    }),
-    getWorkspaceSession: () => session,
-    getRepo: () => null,
-    getRepos: () => [],
-    getAllWorktreeMeta: () => ({}),
-    setWorkspaceSession: vi.fn(),
-    flushOrThrow: vi.fn(),
-    createTerminalArchiveStore: vi.fn()
-  }
-}
-
-function makeHotSnapshot(): RuntimeMobileSessionTabsSnapshot {
-  return {
-    worktree: WORKTREE_ID,
-    publicationEpoch: 'headless:fixture',
-    snapshotVersion: 1,
-    activeGroupId: null,
-    activeTabId: HOT_TAB_ID,
-    activeTabType: 'terminal',
-    tabs: [
-      {
-        type: 'terminal',
-        id: `${HOT_TAB_ID}::${HOT_LEAF_ID}`,
-        parentTabId: HOT_TAB_ID,
-        leafId: HOT_LEAF_ID,
-        ptyId: HOT_PTY_ID,
-        title: 'Background shell',
-        isActive: true,
-        parentLayout: {
-          root: { type: 'leaf', leafId: HOT_LEAF_ID },
-          activeLeafId: HOT_LEAF_ID,
-          expandedLeafId: null,
-          ptyIdsByLeafId: { [HOT_LEAF_ID]: HOT_PTY_ID }
-        }
-      }
-    ]
-  }
-}
-
-function fullyEligibleHotCandidate(activityGeneration = 0): IdleEmptyTerminalReclaimCandidate {
-  return {
-    tabId: HOT_TAB_ID,
-    leafId: HOT_LEAF_ID,
-    ptyId: HOT_PTY_ID,
-    worktreeId: WORKTREE_ID,
-    incarnationId: HOT_INCARNATION_ID,
-    expectedIncarnationId: HOT_INCARNATION_ID,
-    activityGeneration,
-    expectedActivityGeneration: activityGeneration,
-    isSinglePane: true,
-    hasExactTabLeafPtyWorktreeBinding: true,
-    hasSharedPty: false,
-    isPersisted: false,
-    rendererOwnsPersistedTab: false,
-    origin: 'cli',
-    used: false,
-    isPinned: false,
-    isSleepingOrHibernating: false,
-    hasPendingRestoreOrReconnect: false,
-    hasStartupCommand: false,
-    hasLaunchConfig: false,
-    hasResumeProviderSession: false,
-    hasLaunchAgent: false,
-    hasForegroundAgent: false,
-    agentStatus: 'none',
-    hasProviderSession: false,
-    hasOrchestrationOwnership: false,
-    lastActivityAt: 0,
-    providerConnected: true,
-    providerWritable: true,
-    inspection: { status: 'success', foregroundProcess: 'shell', hasChildProcesses: false },
-    rendererVisibility: 'hidden',
-    hasMobileDriver: false,
-    hasMobileSubscriber: false,
-    hasRemoteDesktopViewer: false,
-    isActiveCoordinatorHandle: false,
-    hasPendingOrDispatchedContext: false,
-    hasInFlightTransaction: false,
-    hasSecondConfirmation: true,
-    hasExactIdentityClaim: true
-  }
-}
-
-function createHotOnlyRuntime(options: {
-  stopAndWait: (ptyId: string) => Promise<boolean>
-  hasPty: (ptyId: string) => boolean | null
-  getAgentStatusSnapshot?: () => AgentStatusIpcPayload[]
-  includeAgentStatusAuthority?: boolean
-}) {
-  const session = getDefaultWorkspaceSession()
-  const store = makeStore(session)
-  const runtime = new OrcaRuntimeService(
-    store as never,
-    undefined,
-    options.includeAgentStatusAuthority === false
-      ? undefined
-      : { getAgentStatusSnapshot: options.getAgentStatusSnapshot ?? (() => []) }
-  )
-  const internals = runtime as unknown as RuntimeIdleReclaimInternals
-  internals.graphStatus = 'ready'
-  internals.mobileSessionTabsByWorktree.set(WORKTREE_ID, makeHotSnapshot())
-  const pty = internals.recordPtyWorktree(HOT_PTY_ID, WORKTREE_ID, {
-    connected: true,
-    incarnationId: HOT_INCARNATION_ID,
-    tabId: HOT_TAB_ID,
-    paneKey: HOT_PANE_KEY
-  })
-  pty.creationOrigin = 'cli'
-  internals.launchFactsAuthoritativeIncarnationByPtyId.set(HOT_PTY_ID, HOT_INCARNATION_ID)
-  const spawn = vi.fn()
-  runtime.setPtyController({
-    spawn,
-    write: vi.fn(() => true),
-    kill: vi.fn(() => true),
-    stopAndWait: options.stopAndWait,
-    hasPty: options.hasPty,
-    getForegroundProcess: vi.fn(async () => 'zsh'),
-    inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
-  })
-  runtime.preAllocateHandleForPty(HOT_PTY_ID)
-  return { runtime, internals, pty, store, spawn }
-}
+  HOT_INCARNATION_ID,
+  HOT_LEAF_ID,
+  HOT_PANE_KEY,
+  HOT_PTY_ID,
+  HOT_TAB_ID,
+  resetReclaimLifecycleFixture,
+  SECOND_INCARNATION_ID,
+  SECOND_LEAF_ID,
+  SECOND_PTY_ID,
+  SECOND_TAB_ID,
+  WORKTREE_ID,
+  createReclaimLifecycleRuntime,
+  prepareSecondHotOnlyLifecycle,
+  pruneNaturallyExitedPtyRecords,
+  syncReclaimGraph
+} from './idle-empty-terminal-reclaim-lifecycle-fixture'
+import {
+  createArchiveTransactionCarrierHarness,
+  createMutationTransactionCarrierHarness,
+  createPaneRecoveryTransactionCarrierHarness,
+  createSleepStateTransactionCarrierHarness,
+  createSleepTransactionCarrierHarness,
+  type ReclaimTransactionCarrierHarness
+} from './idle-empty-terminal-reclaim-transaction-carrier-fixture'
+import {
+  createHotOnlyRuntime,
+  fullyEligibleHotCandidate,
+  type RuntimeIdleReclaimInternals
+} from './idle-empty-terminal-reclaim-hot-only-fixture'
+import type { OrcaRuntimeService } from './orca-runtime'
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
+  resetReclaimLifecycleFixture()
 })
 
 describe('idle empty-terminal reclaim hot-only executor', () => {
@@ -682,4 +520,300 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
     expect(internals.reclaimInFlightByPtyId).toEqual(new Map())
     runtime.dispose()
   })
+})
+
+function secondHotOnlyCandidate() {
+  return {
+    ...fullyEligibleHotCandidate(1),
+    tabId: SECOND_TAB_ID,
+    leafId: SECOND_LEAF_ID,
+    ptyId: SECOND_PTY_ID,
+    incarnationId: SECOND_INCARNATION_ID,
+    expectedIncarnationId: SECOND_INCARNATION_ID,
+    activityGeneration: 1,
+    expectedActivityGeneration: 1
+  }
+}
+
+async function reclaimSecondHotOnlyTerminal(internals: RuntimeIdleReclaimInternals) {
+  const candidate = secondHotOnlyCandidate()
+  return internals.reclaimHotOnlyIdleTerminal(candidate, {
+    enabled: true,
+    idleThresholdMs: 5 * 60 * 1000
+  })
+}
+
+async function expectTransactionCarrierToHoldAndThenRelease(
+  createCarrier: () => Promise<ReclaimTransactionCarrierHarness>,
+  bypassAdmission = false
+): Promise<void> {
+  const carrier = await createCarrier()
+  if (bypassAdmission) {
+    vi.spyOn(carrier.internals, 'collectIdleEmptyTerminalReclaimConfirmation').mockResolvedValue(
+      secondHotOnlyCandidate()
+    )
+  }
+  await reclaimSecondHotOnlyTerminal(carrier.internals)
+  expect(carrier.stopAndWait).toHaveBeenCalledOnce()
+  await carrier.releaseCarrier()
+  await expect(reclaimSecondHotOnlyTerminal(carrier.internals)).resolves.toMatchObject({
+    reclaimed: true
+  })
+  expect(carrier.stopAndWait).toHaveBeenCalledTimes(2)
+  expect(carrier.stopAndWait).toHaveBeenLastCalledWith(SECOND_PTY_ID)
+  carrier.runtime.dispose()
+}
+
+describe('idle terminal reclaim ambiguity latch', () => {
+  it('latches a null post-stop identity and prevents a second hot-only stop', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('null-ambiguity')
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledOnce()
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('releases capacity after ordinary lifecycle cleanup completes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('normal')
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    await expect(reclaimSecondHotOnlyTerminal(internals)).resolves.toMatchObject({
+      reclaimed: true
+    })
+
+    expect(stopAndWait).toHaveBeenCalledTimes(2)
+    expect(stopAndWait).toHaveBeenLastCalledWith(SECOND_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('preserves a different non-null replacement with a cleared pane identity and releases capacity', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('replacement')
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledTimes(2)
+    expect(stopAndWait).toHaveBeenLastCalledWith(SECOND_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('releases the latch after a different PTY adopts the captured leaf alias', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('null-ambiguity')
+    const second = { tabId: SECOND_TAB_ID, leafId: SECOND_LEAF_ID, ptyId: SECOND_PTY_ID }
+    const replacement = {
+      tabId: HOT_TAB_ID,
+      leafId: HOT_LEAF_ID,
+      ptyId: 'pty-reclaim-different-replacement'
+    }
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    runtime.onPtySpawned(replacement.ptyId, 'different-replacement', { awaitsRegistration: false })
+    runtime.registerPty(replacement.ptyId, WORKTREE_ID, null, {
+      tabId: replacement.tabId,
+      leafId: replacement.leafId,
+      incarnationId: 'different-replacement'
+    })
+    runtime.preAllocateHandleForPty(replacement.ptyId)
+    syncReclaimGraph(runtime, {
+      tabs: [replacement],
+      leaves: [replacement],
+      mobile: [replacement, second]
+    })
+    runtime.onPtyExit(HOT_PTY_ID, 0)
+    pruneNaturallyExitedPtyRecords(runtime)
+    syncReclaimGraph(runtime, {
+      tabs: [replacement],
+      leaves: [replacement],
+      mobile: [replacement, second]
+    })
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledTimes(2)
+    expect(stopAndWait).toHaveBeenLastCalledWith(SECOND_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('keeps the latch when the captured leaf alias remains bound to its PTY', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('null-ambiguity')
+    const second = { tabId: SECOND_TAB_ID, leafId: SECOND_LEAF_ID, ptyId: SECOND_PTY_ID }
+    const samePtyReplacement = { tabId: HOT_TAB_ID, leafId: HOT_LEAF_ID, ptyId: HOT_PTY_ID }
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    runtime.onPtySpawned(HOT_PTY_ID, 'same-pty-replacement', { awaitsRegistration: false })
+    runtime.registerPty(HOT_PTY_ID, WORKTREE_ID, null, {
+      tabId: HOT_TAB_ID,
+      leafId: HOT_LEAF_ID,
+      incarnationId: 'same-pty-replacement'
+    })
+    runtime.preAllocateHandleForPty(HOT_PTY_ID)
+    syncReclaimGraph(runtime, {
+      tabs: [samePtyReplacement],
+      leaves: [samePtyReplacement],
+      mobile: [samePtyReplacement, second]
+    })
+    syncReclaimGraph(runtime, {
+      tabs: [samePtyReplacement],
+      leaves: [samePtyReplacement],
+      mobile: [samePtyReplacement, second]
+    })
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledOnce()
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('holds while residue remains and passively releases only after it disappears', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('null-ambiguity')
+    const second = { tabId: SECOND_TAB_ID, leafId: SECOND_LEAF_ID, ptyId: SECOND_PTY_ID }
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    await reclaimSecondHotOnlyTerminal(internals)
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledOnce()
+    runtime.onPtyExit(HOT_PTY_ID, 0)
+    pruneNaturallyExitedPtyRecords(runtime)
+    syncReclaimGraph(runtime, { tabs: [], leaves: [], mobile: second })
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledTimes(2)
+    expect(stopAndWait).toHaveBeenLastCalledWith(SECOND_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('keeps the latch while headlessTerminalArchiveByOperationId is in flight', async () => {
+    await expectTransactionCarrierToHoldAndThenRelease(createArchiveTransactionCarrierHarness, true)
+  })
+
+  it('keeps the latch while terminalSleepByWorktreeId is in flight', async () => {
+    await expectTransactionCarrierToHoldAndThenRelease(createSleepTransactionCarrierHarness, true)
+  })
+
+  it('keeps the latch while terminalMutationTailByWorktreeId remains', async () => {
+    await expectTransactionCarrierToHoldAndThenRelease(createMutationTransactionCarrierHarness)
+  })
+
+  it('keeps the latch while terminalSleepStateByWorktreeId retains the latched PTY', async () => {
+    await expectTransactionCarrierToHoldAndThenRelease(createSleepStateTransactionCarrierHarness)
+  })
+
+  it('keeps the latch while terminalPaneRecoveryByIdentity is in flight', async () => {
+    await expectTransactionCarrierToHoldAndThenRelease(createPaneRecoveryTransactionCarrierHarness)
+  })
+
+  it('does not retain the latch for its own completed reclaim claim', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('null-ambiguity')
+    const second = { tabId: SECOND_TAB_ID, leafId: SECOND_LEAF_ID, ptyId: SECOND_PTY_ID }
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    runtime.onPtyExit(HOT_PTY_ID, 0)
+    pruneNaturallyExitedPtyRecords(runtime)
+    syncReclaimGraph(runtime, { tabs: [], leaves: [], mobile: second })
+    await expect(reclaimSecondHotOnlyTerminal(internals)).resolves.toMatchObject({
+      reclaimed: true
+    })
+
+    expect(stopAndWait).toHaveBeenCalledTimes(2)
+    expect(stopAndWait).toHaveBeenLastCalledWith(SECOND_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('keeps the latch for a layout-only terminal PTY carrier', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } =
+      await createReclaimLifecycleRuntime('null-ambiguity')
+    const second = { tabId: SECOND_TAB_ID, leafId: SECOND_LEAF_ID, ptyId: SECOND_PTY_ID }
+    const layoutOnlyTarget = {
+      tabId: HOT_TAB_ID,
+      leafId: HOT_LEAF_ID,
+      ptyId: HOT_PTY_ID,
+      tabPtyId: null
+    }
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds, [layoutOnlyTarget])
+    runtime.onPtyExit(HOT_PTY_ID, 0)
+    pruneNaturallyExitedPtyRecords(runtime)
+    syncReclaimGraph(runtime, { tabs: [], leaves: [], mobile: [layoutOnlyTarget, second] })
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledOnce()
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    runtime.dispose()
+  })
+
+  it('keeps the latch for an orphaned same-PTY handle after its captured token disappears', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const { runtime, internals, stopAndWait, livePtyIds } = await createReclaimLifecycleRuntime(
+      'null-ambiguity-without-leaf'
+    )
+    const second = { tabId: SECOND_TAB_ID, leafId: SECOND_LEAF_ID, ptyId: SECOND_PTY_ID }
+    const alternateLeaf = {
+      tabId: '99999999-9999-4999-8999-999999999999',
+      leafId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      ptyId: HOT_PTY_ID
+    }
+
+    prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+    runtime.registerPreAllocatedHandleForPty(HOT_PTY_ID, 'term_reclaim_other_handle')
+    syncReclaimGraph(runtime, { tabs: [alternateLeaf], leaves: [alternateLeaf], mobile: second })
+    runtime.registerPreAllocatedHandleForPty(HOT_PTY_ID, 'term_reclaim_current_handle')
+    syncReclaimGraph(runtime, { tabs: [], leaves: [], mobile: second })
+    runtime.onPtyExit(HOT_PTY_ID, 0)
+    pruneNaturallyExitedPtyRecords(runtime)
+    syncReclaimGraph(runtime, { tabs: [], leaves: [], mobile: second })
+    await reclaimSecondHotOnlyTerminal(internals)
+
+    expect(stopAndWait).toHaveBeenCalledOnce()
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    runtime.dispose()
+  })
+
+  it.each(['reloading', 'unavailable'] as const)(
+    'keeps the latch while the incoming graph is %s',
+    async (graphStatus) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(0)
+      const { runtime, internals, stopAndWait, livePtyIds } =
+        await createReclaimLifecycleRuntime('null-ambiguity')
+      const second = { tabId: SECOND_TAB_ID, leafId: SECOND_LEAF_ID, ptyId: SECOND_PTY_ID }
+
+      prepareSecondHotOnlyLifecycle(runtime, livePtyIds)
+      runtime.onPtyExit(HOT_PTY_ID, 0)
+      pruneNaturallyExitedPtyRecords(runtime)
+      internals.graphStatus = graphStatus
+      syncReclaimGraph(runtime, { tabs: [], leaves: [], mobile: second })
+      await reclaimSecondHotOnlyTerminal(internals)
+
+      expect(stopAndWait).toHaveBeenCalledOnce()
+      expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+      runtime.dispose()
+    }
+  )
 })

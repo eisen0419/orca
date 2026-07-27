@@ -28,6 +28,11 @@ import {
   type IdleEmptyTerminalReclaimInspection,
   type IdleEmptyTerminalReclaimRefusalReason
 } from './idle-empty-terminal-reclaim'
+import type {
+  IdleTerminalReclaimAmbiguityLatch,
+  IdleTerminalReclaimReconciliationSlot,
+  IdleTerminalReclaimReservation
+} from './idle-terminal-reclaim-reconciliation-slot'
 import {
   createTerminalTitleTracker,
   stripBrailleSpinnerGlyphs,
@@ -2677,6 +2682,8 @@ export class OrcaRuntimeService {
     { handle: string; incarnationId: string; wslDistro?: string | null }
   >()
   private detachedPreAllocatedLeaves = new Map<string, RuntimeLeafRecord>()
+  // Why: a null post-stop identity blocks further reclaim until its residue naturally disappears.
+  private idleTerminalReclaimReservationOrLatch: IdleTerminalReclaimReconciliationSlot | null = null
   private graphSyncCallbacks: (() => void)[] = []
   private waitersByHandle = new Map<string, Set<TerminalWaiter>>()
   private ptyController: RuntimePtyController | null = null
@@ -3186,6 +3193,7 @@ export class OrcaRuntimeService {
 
   dispose(): void {
     this.idleEmptyTerminalReclaimScheduler.dispose()
+    this.idleTerminalReclaimReservationOrLatch = null
   }
 
   private async tickIdleEmptyTerminalReclaim(): Promise<void> {
@@ -3490,31 +3498,53 @@ export class OrcaRuntimeService {
     if (!controller?.hasPty || !controller.stopAndWait || controller.hasPty(ptyId) !== true) {
       return false
     }
-    // Point of no return: all identity, ownership, and provider checks are above this stop.
-    const stopped = await controller.stopAndWait(ptyId)
-    if (!stopped || controller.hasPty(ptyId) !== false) {
+    const reservation = this.acquireIdleTerminalReclaimReservation()
+    if (!reservation) {
       return false
     }
-    const exitedPty = this.ptysById.get(ptyId)
-    if (!this.canCompleteHotOnlyIdleTerminalReclaim(exitedPty, claim.incarnationId)) {
-      return false
-    }
+    let retainedLatch = false
+    try {
+      const latch: IdleTerminalReclaimAmbiguityLatch = {
+        claimIncarnationId: claim.incarnationId,
+        worktreeId,
+        tabId,
+        leafId,
+        ptyId
+      }
+      // Point of no return: all identity, ownership, and provider checks are above this stop.
+      const stopped = await controller.stopAndWait(ptyId)
+      if (!stopped || controller.hasPty(ptyId) !== false) {
+        return false
+      }
+      const exitedPty = this.ptysById.get(ptyId)
+      if (!this.canCompleteHotOnlyIdleTerminalReclaim(exitedPty, claim.incarnationId)) {
+        if (exitedPty?.incarnationId === null) {
+          this.retainIdleTerminalReclaimAmbiguityLatch(reservation, latch)
+          retainedLatch = true
+        }
+        return false
+      }
 
-    const mobileSessionChanged = this.completeHotOnlyIdleTerminalReclaimCleanup({
-      ptyId,
-      tabId,
-      leafId,
-      worktreeId
-    })
-    if (mobileSessionChanged) {
-      try {
-        this.notifyMobileSessionTabsChanged(worktreeId)
-      } catch (error) {
-        // Why: notification failure must not misreport the already-complete terminal reclaim.
-        console.error('[idle-empty-terminal-reclaim] mobile session listener threw', error)
+      const mobileSessionChanged = this.completeHotOnlyIdleTerminalReclaimCleanup({
+        ptyId,
+        tabId,
+        leafId,
+        worktreeId
+      })
+      if (mobileSessionChanged) {
+        try {
+          this.notifyMobileSessionTabsChanged(worktreeId)
+        } catch (error) {
+          // Why: notification failure must not misreport the already-complete terminal reclaim.
+          console.error('[idle-empty-terminal-reclaim] mobile session listener threw', error)
+        }
+      }
+      return true
+    } finally {
+      if (!retainedLatch) {
+        this.releaseIdleTerminalReclaimReservation(reservation)
       }
     }
-    return true
   }
 
   private canCompleteHotOnlyIdleTerminalReclaim(
@@ -3555,6 +3585,30 @@ export class OrcaRuntimeService {
     this.disposeHeadlessTerminal(ptyId)
     this.dropDisconnectedPtyRecord(ptyId)
     return mobileSessionChanged
+  }
+
+  private acquireIdleTerminalReclaimReservation(): IdleTerminalReclaimReservation | null {
+    if (this.idleTerminalReclaimReservationOrLatch) {
+      return null
+    }
+    const reservation: IdleTerminalReclaimReservation = { kind: 'reservation' }
+    this.idleTerminalReclaimReservationOrLatch = reservation
+    return reservation
+  }
+
+  private releaseIdleTerminalReclaimReservation(reservation: IdleTerminalReclaimReservation): void {
+    if (this.idleTerminalReclaimReservationOrLatch === reservation) {
+      this.idleTerminalReclaimReservationOrLatch = null
+    }
+  }
+
+  private retainIdleTerminalReclaimAmbiguityLatch(
+    reservation: IdleTerminalReclaimReservation,
+    latch: IdleTerminalReclaimAmbiguityLatch
+  ): void {
+    if (this.idleTerminalReclaimReservationOrLatch === reservation) {
+      this.idleTerminalReclaimReservationOrLatch = { kind: 'ambiguity-latch', latch }
+    }
   }
 
   private hasExactHotOnlyIdleTerminalOwnership(
@@ -5274,6 +5328,9 @@ export class OrcaRuntimeService {
 
     this.leaves = nextLeaves
     this.rebuildLeafPtyIndex()
+    if (this.graphStatus === 'ready') {
+      this.releaseIdleTerminalReclaimAmbiguityLatchWhenNaturallyCleared()
+    }
     // Why: the emitted client payload is a function of the stored snapshot AND
     // the tab/leaf graph (handles/titles/connected resolve from leaf state), so
     // a graph-only change — e.g. a restored leaf binding its ptyId while the
@@ -5326,6 +5383,88 @@ export class OrcaRuntimeService {
       ...this.getStatus(),
       ...(agentOrchestrationByPaneKey ? { agentOrchestrationByPaneKey } : {})
     }
+  }
+
+  private releaseIdleTerminalReclaimAmbiguityLatchWhenNaturallyCleared(): void {
+    const slot = this.idleTerminalReclaimReservationOrLatch
+    if (!slot || slot.kind !== 'ambiguity-latch') {
+      return
+    }
+    const { latch } = slot
+    const leafKey = this.getLeafKey(latch.tabId, latch.leafId)
+    const surfaceRemains =
+      this.mobileSessionTabsByWorktree
+        .get(latch.worktreeId)
+        ?.tabs.some(
+          (tab) =>
+            tab.type === 'terminal' &&
+            tab.parentTabId === latch.tabId &&
+            tab.leafId === latch.leafId &&
+            (tab.ptyId === latch.ptyId ||
+              tab.parentLayout?.ptyIdsByLeafId?.[latch.leafId] === latch.ptyId)
+        ) ?? false
+    const leaf = this.leaves.get(leafKey)
+    const leafRemains =
+      leaf?.ptyId === latch.ptyId &&
+      leaf.worktreeId === latch.worktreeId &&
+      leaf.tabId === latch.tabId &&
+      leaf.leafId === latch.leafId
+    const leafAliasHandle = this.handleByLeafKey.get(leafKey)
+    const leafAliasRemains =
+      leafAliasHandle !== undefined && this.handles.get(leafAliasHandle)?.ptyId === latch.ptyId
+    const handleRemains =
+      this.handleByPtyId.has(latch.ptyId) ||
+      leafAliasRemains ||
+      [...this.handles.values()].some((record) => record.ptyId === latch.ptyId)
+    const waiterRemains = [...this.waitersByHandle].some(
+      ([handle, waiters]) =>
+        waiters.size > 0 &&
+        (this.handles.get(handle)?.ptyId === latch.ptyId ||
+          this.handleByPtyId.get(latch.ptyId) === handle ||
+          (leafAliasHandle === handle && this.handles.get(handle)?.ptyId === latch.ptyId))
+    )
+    const archiveOperationRemains = [...this.headlessTerminalArchiveByOperationId.keys()].some(
+      (operationId) => /^user-close:([^:]+):/.exec(operationId)?.[1] === latch.tabId
+    )
+    const sleepingWorktreeRemains = this.terminalSleepByWorktreeId.has(latch.worktreeId)
+    const mutatingWorktreeRemains = this.terminalMutationTailByWorktreeId.has(
+      runtimeWorktreeIdentityKey(latch.worktreeId)
+    )
+    const terminalSleepState = this.terminalSleepStateByWorktreeId.get(
+      runtimeWorktreeIdentityKey(latch.worktreeId)
+    )
+    const terminalSleepStateRemains =
+      terminalSleepState?.ptyIds.includes(latch.ptyId) ||
+      terminalSleepState?.terminalHandlesByPtyId[latch.ptyId] !== undefined
+    const paneRecoveryRemains = this.terminalPaneRecoveryByIdentity.has(
+      `${latch.worktreeId}\0${makePaneKey(latch.tabId, latch.leafId)}`
+    )
+    const detached = this.detachedPreAllocatedLeaves.get(latch.ptyId)
+    const detachedRemains =
+      detached?.ptyId === latch.ptyId &&
+      detached.worktreeId === latch.worktreeId &&
+      detached.tabId === latch.tabId &&
+      detached.leafId === latch.leafId
+    const headlessRemains = this.headlessTerminals.has(latch.ptyId)
+    const recordRemains = this.ptysById.has(latch.ptyId)
+    if (
+      surfaceRemains ||
+      leafRemains ||
+      handleRemains ||
+      waiterRemains ||
+      archiveOperationRemains ||
+      sleepingWorktreeRemains ||
+      mutatingWorktreeRemains ||
+      terminalSleepStateRemains ||
+      paneRecoveryRemains ||
+      detachedRemains ||
+      headlessRemains ||
+      recordRemains
+    ) {
+      return
+    }
+    // Why: ambiguity clears only after every captured residue vanished without reclaim action.
+    this.idleTerminalReclaimReservationOrLatch = null
   }
 
   // Why: toMobileSessionTabsResult resolves handles/titles from this.tabs and
