@@ -205,16 +205,20 @@ function layoutContainsTabGroup(layout: TabGroupLayoutNode, groupId: string): bo
   )
 }
 
-function isRegisteredTerminalTabInVisibleLayout(
+function resolveTerminalTabRendererVisibility(
   state: AppState,
   tabId: string,
-  worktreeId: string
-): boolean {
+  worktreeId: string,
+  renderedVisibility: 'hidden' | 'visible' | null
+): 'hidden' | 'visible' | null {
+  if (renderedVisibility === null) {
+    return null
+  }
   const unifiedTab = (state.unifiedTabsByWorktree[worktreeId] ?? []).find(
     (tab) => tab.contentType === 'terminal' && tab.entityId === tabId
   )
   if (!unifiedTab) {
-    return false
+    return null
   }
   const layout = getEffectiveLayoutForWorktree(
     worktreeId,
@@ -223,6 +227,8 @@ function isRegisteredTerminalTabInVisibleLayout(
     state.activeGroupIdByWorktree
   )
   return layout !== undefined && layoutContainsTabGroup(layout, unifiedTab.groupId)
+    ? renderedVisibility
+    : null
 }
 
 function clearScheduledRuntimeGraphSync(): void {
@@ -623,13 +629,12 @@ async function syncRuntimeGraph(): Promise<void> {
     const activePaneId = manager?.getActivePane()?.id ?? null
     const root =
       container?.firstElementChild instanceof HTMLElement ? container.firstElementChild : null
-    const rendererVisibility = isRegisteredTerminalTabInVisibleLayout(
+    const rendererVisibility = resolveTerminalTabRendererVisibility(
       state,
       tabId,
-      registeredTab.worktreeId
+      registeredTab.worktreeId,
+      registeredTab.getRendererVisibility?.() ?? null
     )
-      ? (registeredTab.getRendererVisibility?.() ?? null)
-      : null
 
     graph.tabs.push({
       tabId,
@@ -698,6 +703,12 @@ async function syncRuntimeGraph(): Promise<void> {
         continue
       }
       const title = resolveRuntimeTerminalTitle(tab, generatedTitlesEnabled)
+      const rendererVisibility = resolveTerminalTabRendererVisibility(
+        state,
+        tab.id,
+        worktreeId,
+        null
+      )
       graph.tabs.push({
         tabId: tab.id,
         worktreeId,
@@ -711,7 +722,7 @@ async function syncRuntimeGraph(): Promise<void> {
               `[sync-runtime-graph] synthesized layout for ${leafCount} unmounted leaves with no saved tree`
             )
         }),
-        rendererVisibility: state.activeTabId === tab.id ? 'visible' : 'hidden',
+        ...(rendererVisibility ? { rendererVisibility } : {}),
         ...(tab.creationOrigin ? { creationOrigin: tab.creationOrigin } : {}),
         ...(tab.hasEverReceivedExternalInput === true
           ? { hasEverReceivedExternalInput: true as const }

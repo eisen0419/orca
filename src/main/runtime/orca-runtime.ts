@@ -2757,11 +2757,6 @@ export class OrcaRuntimeService {
     string,
     { incarnationId: string; activityGeneration: number }
   >()
-  // Lets onPtyExit preserve the claim generation for the stop this transaction initiated.
-  private reclaimStopInFlightByPtyId = new Map<
-    string,
-    { incarnationId: string; activityGeneration: number }
-  >()
   private readonly idleEmptyTerminalReclaimScheduler = new IdleEmptyTerminalReclaimScheduler(
     () => this.tickIdleEmptyTerminalReclaim(),
     {
@@ -3495,49 +3490,39 @@ export class OrcaRuntimeService {
     if (!controller?.hasPty || !controller.stopAndWait || controller.hasPty(ptyId) !== true) {
       return false
     }
-    this.reclaimStopInFlightByPtyId.set(ptyId, claim)
-    try {
-      // Point of no return: all identity, ownership, and provider checks are above this stop.
-      const stopped = await controller.stopAndWait(ptyId)
-      if (!stopped || controller.hasPty(ptyId) !== false) {
-        return false
-      }
-      const exitedPty = this.ptysById.get(ptyId)
-      if (
-        !exitedPty ||
-        exitedPty.incarnationId !== claim.incarnationId ||
-        exitedPty.activityGeneration !== claim.activityGeneration ||
-        exitedPty.connected
-      ) {
-        return false
-      }
-      const snapshot = this.mobileSessionTabsByWorktree.get(worktreeId)
-      if (snapshot) {
-        const retired = retireTerminalSurfacesFromSnapshot({
-          snapshot,
-          ptyId,
-          exactSurfaces: [{ parentTabId: tabId, leafId }],
-          exactOnly: true
-        })
-        if (retired) {
-          this.mobileSessionTabsByWorktree.set(worktreeId, retired.snapshot)
-          this.notifyMobileSessionTabsChanged(worktreeId)
-        }
-      }
-      this.leaves.delete(this.getLeafKey(tabId, leafId))
-      this.rebuildLeafPtyIndex()
-      this.invalidateAllHandlesForPty(ptyId)
-      this.detachedPreAllocatedLeaves.delete(ptyId)
-      this.disposeHeadlessTerminal(ptyId)
-      if (this.ptysById.get(ptyId)?.incarnationId === claim.incarnationId) {
-        this.dropDisconnectedPtyRecord(ptyId)
-      }
-      return true
-    } finally {
-      if (this.reclaimStopInFlightByPtyId.get(ptyId) === claim) {
-        this.reclaimStopInFlightByPtyId.delete(ptyId)
+    // Point of no return: all identity, ownership, and provider checks are above this stop.
+    const stopped = await controller.stopAndWait(ptyId)
+    if (!stopped || controller.hasPty(ptyId) !== false) {
+      return false
+    }
+    const exitedPty = this.ptysById.get(ptyId)
+    if (
+      exitedPty?.incarnationId !== null &&
+      exitedPty?.incarnationId !== undefined &&
+      exitedPty.incarnationId !== claim.incarnationId
+    ) {
+      return false
+    }
+    const snapshot = this.mobileSessionTabsByWorktree.get(worktreeId)
+    if (snapshot) {
+      const retired = retireTerminalSurfacesFromSnapshot({
+        snapshot,
+        ptyId,
+        exactSurfaces: [{ parentTabId: tabId, leafId }],
+        exactOnly: true
+      })
+      if (retired) {
+        this.mobileSessionTabsByWorktree.set(worktreeId, retired.snapshot)
+        this.notifyMobileSessionTabsChanged(worktreeId)
       }
     }
+    this.leaves.delete(this.getLeafKey(tabId, leafId))
+    this.rebuildLeafPtyIndex()
+    this.invalidateAllHandlesForPty(ptyId)
+    this.detachedPreAllocatedLeaves.delete(ptyId)
+    this.disposeHeadlessTerminal(ptyId)
+    this.dropDisconnectedPtyRecord(ptyId)
+    return true
   }
 
   private hasExactHotOnlyIdleTerminalOwnership(
@@ -12179,14 +12164,7 @@ export class OrcaRuntimeService {
       exitIncarnationId ??
       pty?.incarnationId ??
       `runtime:${this.runtimeId}:${this.getPtyLifecycleGeneration(ptyId)}`
-    const reclaimStop = this.reclaimStopInFlightByPtyId.get(ptyId)
-    const exitWasInitiatedByExactReclaimStop =
-      reclaimStop !== undefined &&
-      pty?.incarnationId === reclaimStop.incarnationId &&
-      pty.activityGeneration === reclaimStop.activityGeneration
-    if (!exitWasInitiatedByExactReclaimStop) {
-      this.invalidateIdleEmptyTerminalReclaimActivity(ptyId)
-    }
+    this.invalidateIdleEmptyTerminalReclaimActivity(ptyId)
     this.advancePtyLifecycleGeneration(ptyId)
     const exactSurfaceByKey = new Map<
       string,

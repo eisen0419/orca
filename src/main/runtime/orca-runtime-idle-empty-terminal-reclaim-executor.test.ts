@@ -26,6 +26,7 @@ type RuntimeIdleReclaimInternals = {
   >
   mobileSessionTabsByWorktree: Map<string, RuntimeMobileSessionTabsSnapshot>
   ptysById: Map<string, unknown>
+  leaves: Map<string, unknown>
   handleByPtyId: Map<string, string>
   handles: Map<string, unknown>
   reclaimInFlightByPtyId: Map<string, unknown>
@@ -44,6 +45,7 @@ type RuntimeIdleReclaimInternals = {
     lastActivityAt: number
   }
   collectIdleEmptyTerminalReclaimCandidates: () => Promise<IdleEmptyTerminalReclaimCandidate[]>
+  rebuildLeafPtyIndex: () => void
   tickIdleEmptyTerminalReclaim: () => Promise<void>
   collectIdleEmptyTerminalReclaimConfirmation: (
     candidate: IdleEmptyTerminalReclaimCandidate
@@ -345,6 +347,83 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
     expect(internals.handleByPtyId.has(HOT_PTY_ID)).toBe(false)
     expect(internals.handles).toEqual(new Map())
     expect(internals.reclaimInFlightByPtyId).toEqual(new Map())
+    runtime.dispose()
+  })
+
+  it('reclaims post-stop final output residue through the scheduler', async () => {
+    let live = true
+    let runtime: OrcaRuntimeService | null = null
+    let internals: RuntimeIdleReclaimInternals | null = null
+    const stopAndWait = vi.fn(async () => {
+      runtime?.onPtyData(HOT_PTY_ID, 'final shell output', Date.now())
+      live = false
+      runtime?.onPtyExit(HOT_PTY_ID, -1, HOT_INCARNATION_ID)
+      // Why: a hot-only candidate has no renderer leaf before stop; leave one residue for the executor to retire.
+      internals?.leaves.set(`${HOT_TAB_ID}::${HOT_LEAF_ID}`, {
+        tabId: HOT_TAB_ID,
+        leafId: HOT_LEAF_ID,
+        worktreeId: WORKTREE_ID,
+        ptyId: HOT_PTY_ID
+      })
+      internals?.rebuildLeafPtyIndex()
+      return true
+    })
+    const created = createHotOnlyRuntime({ stopAndWait, hasPty: () => live })
+    runtime = created.runtime
+    internals = created.internals
+    const { pty, store, spawn } = created
+    pty.lastActivityAt = 0
+    runtime.setOrchestrationDb({
+      getActiveCoordinatorRun: () => undefined,
+      getActiveDispatchAssignees: () => []
+    } as never)
+
+    await internals.tickIdleEmptyTerminalReclaim()
+
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    expect(internals.mobileSessionTabsByWorktree.get(WORKTREE_ID)?.tabs).toEqual([])
+    expect(internals.leaves.has(`${HOT_TAB_ID}::${HOT_LEAF_ID}`)).toBe(false)
+    expect(internals.ptysById.has(HOT_PTY_ID)).toBe(false)
+    expect(internals.handleByPtyId.has(HOT_PTY_ID)).toBe(false)
+    expect(internals.handles).toEqual(new Map())
+    expect(store.createTerminalArchiveStore).not.toHaveBeenCalled()
+    expect(spawn).not.toHaveBeenCalled()
+    runtime.dispose()
+  })
+
+  it('preserves a replacement incarnation after a successful stop', async () => {
+    let live = true
+    let internals: RuntimeIdleReclaimInternals | null = null
+    const stopAndWait = vi.fn(async () => {
+      live = false
+      const replacement = internals?.recordPtyWorktree(HOT_PTY_ID, WORKTREE_ID, {
+        connected: true,
+        incarnationId: 'replacement-incarnation',
+        tabId: HOT_TAB_ID,
+        paneKey: HOT_PANE_KEY
+      })
+      if (replacement) {
+        replacement.creationOrigin = 'cli'
+      }
+      return true
+    })
+    const created = createHotOnlyRuntime({ stopAndWait, hasPty: () => live })
+    internals = created.internals
+    const { runtime, pty } = created
+    pty.lastActivityAt = 0
+    runtime.setOrchestrationDb({
+      getActiveCoordinatorRun: () => undefined,
+      getActiveDispatchAssignees: () => []
+    } as never)
+
+    await internals.tickIdleEmptyTerminalReclaim()
+
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    expect(internals.ptysById.get(HOT_PTY_ID)).toMatchObject({
+      incarnationId: 'replacement-incarnation'
+    })
+    expect(internals.mobileSessionTabsByWorktree.get(WORKTREE_ID)?.tabs).toHaveLength(1)
+    expect(internals.handleByPtyId.has(HOT_PTY_ID)).toBe(true)
     runtime.dispose()
   })
 
