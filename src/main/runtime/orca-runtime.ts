@@ -3496,13 +3496,45 @@ export class OrcaRuntimeService {
       return false
     }
     const exitedPty = this.ptysById.get(ptyId)
-    if (
-      exitedPty?.incarnationId !== null &&
-      exitedPty?.incarnationId !== undefined &&
-      exitedPty.incarnationId !== claim.incarnationId
-    ) {
+    if (!this.canCompleteHotOnlyIdleTerminalReclaim(exitedPty, claim.incarnationId)) {
       return false
     }
+
+    const mobileSessionChanged = this.completeHotOnlyIdleTerminalReclaimCleanup({
+      ptyId,
+      tabId,
+      leafId,
+      worktreeId
+    })
+    if (mobileSessionChanged) {
+      try {
+        this.notifyMobileSessionTabsChanged(worktreeId)
+      } catch (error) {
+        // Why: notification failure must not misreport the already-complete terminal reclaim.
+        console.error('[idle-empty-terminal-reclaim] mobile session listener threw', error)
+      }
+    }
+    return true
+  }
+
+  private canCompleteHotOnlyIdleTerminalReclaim(
+    exitedPty: RuntimePtyWorktreeRecord | undefined,
+    claimIncarnationId: string
+  ): boolean {
+    if (!exitedPty) {
+      return true
+    }
+    return exitedPty.incarnationId !== null && exitedPty.incarnationId === claimIncarnationId
+  }
+
+  private completeHotOnlyIdleTerminalReclaimCleanup(args: {
+    ptyId: string
+    tabId: string
+    leafId: string
+    worktreeId: string
+  }): boolean {
+    const { ptyId, tabId, leafId, worktreeId } = args
+    let mobileSessionChanged = false
     const snapshot = this.mobileSessionTabsByWorktree.get(worktreeId)
     if (snapshot) {
       const retired = retireTerminalSurfacesFromSnapshot({
@@ -3513,7 +3545,7 @@ export class OrcaRuntimeService {
       })
       if (retired) {
         this.mobileSessionTabsByWorktree.set(worktreeId, retired.snapshot)
-        this.notifyMobileSessionTabsChanged(worktreeId)
+        mobileSessionChanged = true
       }
     }
     this.leaves.delete(this.getLeafKey(tabId, leafId))
@@ -3522,7 +3554,7 @@ export class OrcaRuntimeService {
     this.detachedPreAllocatedLeaves.delete(ptyId)
     this.disposeHeadlessTerminal(ptyId)
     this.dropDisconnectedPtyRecord(ptyId)
-    return true
+    return mobileSessionChanged
   }
 
   private hasExactHotOnlyIdleTerminalOwnership(

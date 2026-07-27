@@ -427,6 +427,118 @@ describe('idle empty-terminal reclaim hot-only executor', () => {
     runtime.dispose()
   })
 
+  it('completes reclaim when a mobile-session listener throws', async () => {
+    let live = true
+    let runtime: OrcaRuntimeService | null = null
+    let internals: RuntimeIdleReclaimInternals | null = null
+    const stopAndWait = vi.fn(async () => {
+      live = false
+      runtime?.onPtyExit(HOT_PTY_ID, -1, HOT_INCARNATION_ID, {
+        skipMobileSessionRetirement: true
+      })
+      internals?.leaves.set(`${HOT_TAB_ID}::${HOT_LEAF_ID}`, {
+        tabId: HOT_TAB_ID,
+        leafId: HOT_LEAF_ID,
+        worktreeId: WORKTREE_ID,
+        ptyId: HOT_PTY_ID
+      })
+      internals?.rebuildLeafPtyIndex()
+      return true
+    })
+    const created = createHotOnlyRuntime({ stopAndWait, hasPty: () => live })
+    runtime = created.runtime
+    internals = created.internals
+    const { pty } = created
+    pty.lastActivityAt = 0
+    runtime.setOrchestrationDb({
+      getActiveCoordinatorRun: () => undefined,
+      getActiveDispatchAssignees: () => []
+    } as never)
+    const unsubscribe = runtime.onMobileSessionTabsChanged(() => {
+      throw new Error('listener failure')
+    })
+    const reportListenerFailure = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    await internals.tickIdleEmptyTerminalReclaim()
+
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    expect(internals.mobileSessionTabsByWorktree.get(WORKTREE_ID)?.tabs).toEqual([])
+    expect(internals.leaves.has(`${HOT_TAB_ID}::${HOT_LEAF_ID}`)).toBe(false)
+    expect(internals.ptysById.has(HOT_PTY_ID)).toBe(false)
+    expect(internals.handleByPtyId.has(HOT_PTY_ID)).toBe(false)
+    expect(internals.handles).toEqual(new Map())
+    expect(reportListenerFailure).toHaveBeenCalled()
+    unsubscribe()
+    runtime.dispose()
+  })
+
+  it('preserves a replacement registered by a mobile-session listener', async () => {
+    let live = true
+    let runtime: OrcaRuntimeService | null = null
+    const stopAndWait = vi.fn(async () => {
+      live = false
+      runtime?.onPtyExit(HOT_PTY_ID, -1, HOT_INCARNATION_ID, {
+        skipMobileSessionRetirement: true
+      })
+      return true
+    })
+    const created = createHotOnlyRuntime({ stopAndWait, hasPty: () => live })
+    runtime = created.runtime
+    const { internals, pty } = created
+    pty.lastActivityAt = 0
+    runtime.setOrchestrationDb({
+      getActiveCoordinatorRun: () => undefined,
+      getActiveDispatchAssignees: () => []
+    } as never)
+    const unsubscribe = runtime.onMobileSessionTabsChanged(() => {
+      runtime?.registerPty(HOT_PTY_ID, WORKTREE_ID, null, {
+        tabId: HOT_TAB_ID,
+        leafId: HOT_LEAF_ID,
+        incarnationId: 'replacement-during-notification'
+      })
+    })
+
+    await internals.tickIdleEmptyTerminalReclaim()
+
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    expect(internals.ptysById.get(HOT_PTY_ID)).toMatchObject({
+      connected: true,
+      incarnationId: 'replacement-during-notification'
+    })
+    unsubscribe()
+    runtime.dispose()
+  })
+
+  it('preserves a connected replacement without an incarnation', async () => {
+    let live = true
+    let runtime: OrcaRuntimeService | null = null
+    let internals: RuntimeIdleReclaimInternals | null = null
+    const stopAndWait = vi.fn(async () => {
+      live = false
+      internals?.ptysById.delete(HOT_PTY_ID)
+      runtime?.registerPty(HOT_PTY_ID, WORKTREE_ID)
+      return true
+    })
+    const created = createHotOnlyRuntime({ stopAndWait, hasPty: () => live })
+    runtime = created.runtime
+    internals = created.internals
+    const { pty } = created
+    pty.lastActivityAt = 0
+    runtime.setOrchestrationDb({
+      getActiveCoordinatorRun: () => undefined,
+      getActiveDispatchAssignees: () => []
+    } as never)
+
+    await internals.tickIdleEmptyTerminalReclaim()
+
+    expect(stopAndWait).toHaveBeenCalledWith(HOT_PTY_ID)
+    expect(internals.ptysById.get(HOT_PTY_ID)).toMatchObject({
+      connected: true,
+      incarnationId: null
+    })
+    runtime.dispose()
+  })
+
   it('rejects a generation changed before the fence and leaves no claim behind', async () => {
     let live = true
     const stopAndWait = vi.fn(async () => true)
