@@ -31,6 +31,11 @@ export type IdleEmptyTerminalReclaimInspection = {
   hasChildProcesses: boolean | null
 } | null
 
+export type IdleEmptyTerminalReclaimPersistedOwner =
+  | { kind: 'renderer'; source: 'ready-exact-renderer-binding' }
+  | { kind: 'runtime'; source: 'serve-or-ssh-pty-id' }
+  | null
+
 export type IdleEmptyTerminalReclaimCandidate = {
   tabId: string | null
   leafId: string | null
@@ -45,6 +50,7 @@ export type IdleEmptyTerminalReclaimCandidate = {
   hasSharedPty: boolean | null
   isPersisted: boolean | null
   rendererOwnsPersistedTab: boolean | null
+  authoritativePersistedOwner: IdleEmptyTerminalReclaimPersistedOwner
   origin?: unknown
   used?: unknown
   isPinned: boolean | null
@@ -101,10 +107,10 @@ function classifyCloseMode(
   if (candidate.isPersisted !== true) {
     return null
   }
-  if (candidate.rendererOwnsPersistedTab === true) {
+  if (candidate.authoritativePersistedOwner?.kind === 'renderer') {
     return 'renderer-owned-persisted'
   }
-  if (candidate.rendererOwnsPersistedTab === false) {
+  if (candidate.authoritativePersistedOwner?.kind === 'runtime') {
     return 'runtime-owned-persisted'
   }
   return null

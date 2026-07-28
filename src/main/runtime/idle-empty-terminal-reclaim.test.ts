@@ -31,6 +31,7 @@ function candidate(
     hasSharedPty: false,
     isPersisted: true,
     rendererOwnsPersistedTab: true,
+    authoritativePersistedOwner: { kind: 'renderer', source: 'ready-exact-renderer-binding' },
     origin: 'cli',
     used: false,
     isPinned: false,
@@ -465,9 +466,20 @@ describe('evaluateIdleReclaimCandidate', () => {
     { mode: 'renderer-owned-persisted', overrides: {} },
     {
       mode: 'runtime-owned-persisted',
-      overrides: { isPersisted: true, rendererOwnsPersistedTab: false }
+      overrides: {
+        isPersisted: true,
+        rendererOwnsPersistedTab: true,
+        authoritativePersistedOwner: { kind: 'runtime', source: 'serve-or-ssh-pty-id' }
+      }
     },
-    { mode: 'hot-only', overrides: { isPersisted: false, rendererOwnsPersistedTab: false } }
+    {
+      mode: 'hot-only',
+      overrides: {
+        isPersisted: false,
+        rendererOwnsPersistedTab: false,
+        authoritativePersistedOwner: null
+      }
+    }
   ])('classifies $mode candidates', ({ mode, overrides }) => {
     expect(evaluate({ candidateOverrides: overrides })).toEqual({ eligible: true, closeMode: mode })
   })
@@ -478,7 +490,10 @@ describe('evaluateIdleReclaimCandidate', () => {
       overrides: { isPersisted: false, rendererOwnsPersistedTab: true }
     },
     { name: 'unknown persistence', overrides: { isPersisted: null } },
-    { name: 'unknown renderer ownership', overrides: { rendererOwnsPersistedTab: null } },
+    {
+      name: 'persisted terminal without a positive owner witness',
+      overrides: { authoritativePersistedOwner: null }
+    },
     {
       name: 'unknown renderer ownership for a hot-only tab',
       overrides: { isPersisted: false, rendererOwnsPersistedTab: null }
@@ -487,6 +502,13 @@ describe('evaluateIdleReclaimCandidate', () => {
     expect(evaluate({ candidateOverrides: overrides })).toEqual({
       eligible: false,
       reason: 'topology-or-binding-invalid'
+    })
+  })
+
+  it('keeps a positive persisted owner witness authoritative over the legacy projection fact', () => {
+    expect(evaluate({ candidateOverrides: { rendererOwnsPersistedTab: null } })).toEqual({
+      eligible: true,
+      closeMode: 'renderer-owned-persisted'
     })
   })
 

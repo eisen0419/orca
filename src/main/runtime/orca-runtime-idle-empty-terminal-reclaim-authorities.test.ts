@@ -105,6 +105,7 @@ function fullyEligibleCandidate(): IdleEmptyTerminalReclaimCandidate {
     hasSharedPty: false,
     isPersisted: false,
     rendererOwnsPersistedTab: false,
+    authoritativePersistedOwner: null,
     origin: 'cli',
     used: false,
     isPinned: false,
@@ -544,7 +545,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
     runtime.dispose()
   })
 
-  it('reconfirms a persisted binding that appears during inspection before classifying', async () => {
+  it('refuses a persisted ordinary daemon when its renderer binding is omitted during inspection', async () => {
     const session = getDefaultWorkspaceSession()
     session.tabsByWorktree[WORKTREE_ID] = []
     let resolveInspection!: (value: {
@@ -586,18 +587,23 @@ describe('OrcaRuntimeService idle empty-terminal reclaim authorities', () => {
     resolveInspection({ foregroundProcess: 'zsh', hasChildProcesses: false })
     const [candidate] = await pendingCandidate
 
-    expect(candidate).toMatchObject({ isPersisted: true, rendererOwnsPersistedTab: false })
+    expect(candidate).toMatchObject({
+      isPersisted: true,
+      rendererOwnsPersistedTab: false,
+      authoritativePersistedOwner: null
+    })
     expect(
       evaluateIdleReclaimCandidate(
         {
           ...fullyEligibleCandidate(),
           isPersisted: candidate?.isPersisted ?? null,
-          rendererOwnsPersistedTab: candidate?.rendererOwnsPersistedTab ?? null
+          rendererOwnsPersistedTab: candidate?.rendererOwnsPersistedTab ?? null,
+          authoritativePersistedOwner: candidate?.authoritativePersistedOwner ?? null
         },
         { enabled: true },
         60 * 60 * 1000
       )
-    ).toEqual({ eligible: true, closeMode: 'runtime-owned-persisted' })
+    ).toEqual({ eligible: false, reason: 'topology-or-binding-invalid' })
     runtime.dispose()
   })
 

@@ -106,6 +106,9 @@ export async function createArchiveTransactionCarrierHarness(): Promise<ReclaimT
       session.tabsByWorktree[WORKTREE_ID] = archivedTabs
       finishArchive({ id: 'archive-1' })
       await close
+      session.tabsByWorktree[WORKTREE_ID] = []
+      delete session.terminalLayoutsByTabId[HOT_TAB_ID]
+      delete session.terminalPtyIncarnationsByPaneKey?.[HOT_PANE_KEY]
       syncReclaimGraph(runtime, { tabs: [], leaves: [], mobile: second })
     }
   }

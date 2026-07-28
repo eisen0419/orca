@@ -122,6 +122,28 @@ export function makeHotSnapshot(): RuntimeMobileSessionTabsSnapshot {
   return makeTerminalSnapshot([{ tabId: HOT_TAB_ID, leafId: HOT_LEAF_ID, ptyId: HOT_PTY_ID }])
 }
 
+export function makeHotDirectOnlySnapshot(): RuntimeMobileSessionTabsSnapshot {
+  return makeTerminalSnapshot([
+    {
+      tabId: HOT_TAB_ID,
+      leafId: HOT_LEAF_ID,
+      ptyId: HOT_PTY_ID,
+      layoutPtyId: 'pty-layout-replacement'
+    }
+  ])
+}
+
+export function makeHotLayoutOnlySnapshot(): RuntimeMobileSessionTabsSnapshot {
+  return makeTerminalSnapshot([
+    {
+      tabId: HOT_TAB_ID,
+      leafId: HOT_LEAF_ID,
+      ptyId: HOT_PTY_ID,
+      tabPtyId: null
+    }
+  ])
+}
+
 export function syncReclaimGraph(
   runtime: OrcaRuntimeService,
   args: {

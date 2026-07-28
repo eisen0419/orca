@@ -81,6 +81,7 @@ export function fullyEligibleHotCandidate(
     hasSharedPty: false,
     isPersisted: false,
     rendererOwnsPersistedTab: false,
+    authoritativePersistedOwner: null,
     origin: 'cli',
     used: false,
     isPinned: false,

@@ -26,6 +26,7 @@ import {
   evaluateIdleReclaimCandidate,
   type IdleEmptyTerminalReclaimCandidate,
   type IdleEmptyTerminalReclaimInspection,
+  type IdleEmptyTerminalReclaimPersistedOwner,
   type IdleEmptyTerminalReclaimRefusalReason
 } from './idle-empty-terminal-reclaim'
 import type {
@@ -1256,6 +1257,11 @@ type IdleEmptyTerminalReclaimTickSnapshot = {
   sleepingPtyIds: ReadonlySet<string> | null
   orchestration: IdleEmptyTerminalReclaimOrchestrationSnapshot | null
 }
+
+type IdleTerminalReclaimResidue =
+  | { kind: 'unknown'; reasons: string[] }
+  | { kind: 'present'; classes: string[] }
+  | { kind: 'clear' }
 
 const IDLE_EMPTY_TERMINAL_RECLAIM_MAX_CANDIDATES_PER_TICK = 64
 const IDLE_EMPTY_TERMINAL_RECLAIM_SNAPSHOT_BUDGET_MS = 50
@@ -3197,6 +3203,7 @@ export class OrcaRuntimeService {
   }
 
   private async tickIdleEmptyTerminalReclaim(): Promise<void> {
+    this.releaseIdleTerminalReclaimAmbiguityLatchWhenNaturallyCleared()
     const settings = this.store?.getSettings()
     const config = {
       enabled: settings?.terminalIdleEmptyReclaimEnabled,
@@ -3334,9 +3341,14 @@ export class OrcaRuntimeService {
           sessionByWorktreeId,
           persistedBindingsBySession
         )
-      : { isPersisted: null, rendererOwnsPersistedTab: null }
+      : {
+          isPersisted: null,
+          rendererOwnsPersistedTab: null,
+          authoritativePersistedOwner: null
+        }
     candidate.isPersisted = ownership.isPersisted
     candidate.rendererOwnsPersistedTab = ownership.rendererOwnsPersistedTab
+    candidate.authoritativePersistedOwner = ownership.authoritativePersistedOwner
     candidate.providerConnected =
       candidate.inspection?.status === 'success' &&
       livePty?.connected === true &&
@@ -3505,11 +3517,16 @@ export class OrcaRuntimeService {
     let retainedLatch = false
     try {
       const latch: IdleTerminalReclaimAmbiguityLatch = {
+        mode: 'hot-only',
         claimIncarnationId: claim.incarnationId,
         worktreeId,
         tabId,
         leafId,
-        ptyId
+        ptyId,
+        ownerKind: 'hot-only',
+        capturedTopologyRevision: null,
+        createdAt: Date.now(),
+        reason: 'post-stop-identity-null'
       }
       // Point of no return: all identity, ownership, and provider checks are above this stop.
       const stopped = await controller.stopAndWait(ptyId)
@@ -3695,7 +3712,11 @@ export class OrcaRuntimeService {
   ) {
     const hasTimeRemaining = (): boolean => Date.now() < deadline
     if (!hasTimeRemaining()) {
-      return { isPersisted: null, rendererOwnsPersistedTab: null }
+      return {
+        isPersisted: null,
+        rendererOwnsPersistedTab: null,
+        authoritativePersistedOwner: null
+      }
     }
     let session: WorkspaceSessionState | null
     if (sessionByWorktreeId.has(pty.worktreeId)) {
@@ -3705,7 +3726,11 @@ export class OrcaRuntimeService {
       sessionByWorktreeId.set(pty.worktreeId, session)
     }
     if (!hasTimeRemaining()) {
-      return { isPersisted: null, rendererOwnsPersistedTab: null }
+      return {
+        isPersisted: null,
+        rendererOwnsPersistedTab: null,
+        authoritativePersistedOwner: null
+      }
     }
     let persistedBindingIndex: IdleEmptyTerminalReclaimPersistedBindingIndex | null = null
     if (session) {
@@ -3720,7 +3745,11 @@ export class OrcaRuntimeService {
         }
       }
       if (persistedBindingIndex === null || !hasTimeRemaining()) {
-        return { isPersisted: null, rendererOwnsPersistedTab: null }
+        return {
+          isPersisted: null,
+          rendererOwnsPersistedTab: null,
+          authoritativePersistedOwner: null
+        }
       }
     }
     return this.collectIdleEmptyTerminalReclaimOwnershipFacts(
@@ -4002,7 +4031,8 @@ export class OrcaRuntimeService {
       rendererTab,
       rendererLeaf,
       hasExactRendererBinding,
-      rendererOwnsPersistedTab
+      rendererOwnsPersistedTab,
+      authoritativePersistedOwner
     } = ownership
     const persistedLeafIds = this.collectPersistedTerminalLeafIds(persistedLayout)
     const hotOnlySnapshot =
@@ -4080,6 +4110,7 @@ export class OrcaRuntimeService {
       hasSharedPty,
       isPersisted,
       rendererOwnsPersistedTab,
+      authoritativePersistedOwner,
       origin: pty.creationOrigin,
       used: pty.hasEverReceivedExternalInput,
       isPinned:
@@ -4200,6 +4231,14 @@ export class OrcaRuntimeService {
           : rendererTab === undefined && rendererLeaf === undefined
             ? false
             : null
+    const authoritativePersistedOwner: IdleEmptyTerminalReclaimPersistedOwner =
+      isPersisted !== true || persistedBindings?.length !== 1
+        ? null
+        : this.isServeOrSshOwnedPtyId(pty.ptyId)
+          ? { kind: 'runtime', source: 'serve-or-ssh-pty-id' }
+          : hasExactRendererBinding
+            ? { kind: 'renderer', source: 'ready-exact-renderer-binding' }
+            : null
 
     return {
       pane,
@@ -4215,7 +4254,8 @@ export class OrcaRuntimeService {
       rendererTab,
       rendererLeaf,
       hasExactRendererBinding,
-      rendererOwnsPersistedTab
+      rendererOwnsPersistedTab,
+      authoritativePersistedOwner
     }
   }
 
@@ -4289,14 +4329,28 @@ export class OrcaRuntimeService {
     tabId: string | null,
     tick: IdleEmptyTerminalReclaimTickSnapshot
   ): boolean | null {
-    if (!tick.archiveInFlightTabIds || !tick.sleepingPtyIds) {
+    const leafId = parsePaneKey(pty.paneKey ?? '')?.leafId
+    if (
+      !tick.archiveInFlightTabIds ||
+      !tick.sleepingPtyIds ||
+      !pty.worktreeId ||
+      !tabId ||
+      !leafId
+    ) {
       return null
     }
-    const archiveInFlight = tabId ? tick.archiveInFlightTabIds.has(tabId) : false
+    const archiveInFlight = tick.archiveInFlightTabIds.has(tabId)
     const sleepingWorktree = this.terminalSleepByWorktreeId.has(pty.worktreeId)
-    const mutatingWorktree = this.terminalMutationTailByWorktreeId.has(pty.worktreeId)
+    const mutatingWorktree = this.terminalMutationTailByWorktreeId.has(
+      runtimeWorktreeIdentityKey(pty.worktreeId)
+    )
     const sleepingPty = tick.sleepingPtyIds.has(pty.ptyId)
-    return archiveInFlight || sleepingWorktree || mutatingWorktree || sleepingPty
+    const paneRecoveryInFlight = this.terminalPaneRecoveryByIdentity.has(
+      `${pty.worktreeId}\0${makePaneKey(tabId, leafId)}`
+    )
+    return (
+      archiveInFlight || sleepingWorktree || mutatingWorktree || sleepingPty || paneRecoveryInFlight
+    )
   }
 
   private invalidateIdleEmptyTerminalReclaimActivity(ptyId: string): void {
@@ -5390,81 +5444,260 @@ export class OrcaRuntimeService {
     if (!slot || slot.kind !== 'ambiguity-latch') {
       return
     }
-    const { latch } = slot
-    const leafKey = this.getLeafKey(latch.tabId, latch.leafId)
-    const surfaceRemains =
-      this.mobileSessionTabsByWorktree
-        .get(latch.worktreeId)
-        ?.tabs.some(
-          (tab) =>
-            tab.type === 'terminal' &&
-            tab.parentTabId === latch.tabId &&
-            tab.leafId === latch.leafId &&
-            (tab.ptyId === latch.ptyId ||
-              tab.parentLayout?.ptyIdsByLeafId?.[latch.leafId] === latch.ptyId)
-        ) ?? false
-    const leaf = this.leaves.get(leafKey)
-    const leafRemains =
-      leaf?.ptyId === latch.ptyId &&
-      leaf.worktreeId === latch.worktreeId &&
-      leaf.tabId === latch.tabId &&
-      leaf.leafId === latch.leafId
-    const leafAliasHandle = this.handleByLeafKey.get(leafKey)
-    const leafAliasRemains =
-      leafAliasHandle !== undefined && this.handles.get(leafAliasHandle)?.ptyId === latch.ptyId
-    const handleRemains =
-      this.handleByPtyId.has(latch.ptyId) ||
-      leafAliasRemains ||
-      [...this.handles.values()].some((record) => record.ptyId === latch.ptyId)
-    const waiterRemains = [...this.waitersByHandle].some(
-      ([handle, waiters]) =>
-        waiters.size > 0 &&
-        (this.handles.get(handle)?.ptyId === latch.ptyId ||
-          this.handleByPtyId.get(latch.ptyId) === handle ||
-          (leafAliasHandle === handle && this.handles.get(handle)?.ptyId === latch.ptyId))
-    )
-    const archiveOperationRemains = [...this.headlessTerminalArchiveByOperationId.keys()].some(
-      (operationId) => /^user-close:([^:]+):/.exec(operationId)?.[1] === latch.tabId
-    )
-    const sleepingWorktreeRemains = this.terminalSleepByWorktreeId.has(latch.worktreeId)
-    const mutatingWorktreeRemains = this.terminalMutationTailByWorktreeId.has(
-      runtimeWorktreeIdentityKey(latch.worktreeId)
-    )
-    const terminalSleepState = this.terminalSleepStateByWorktreeId.get(
-      runtimeWorktreeIdentityKey(latch.worktreeId)
-    )
-    const terminalSleepStateRemains =
-      terminalSleepState?.ptyIds.includes(latch.ptyId) ||
-      terminalSleepState?.terminalHandlesByPtyId[latch.ptyId] !== undefined
-    const paneRecoveryRemains = this.terminalPaneRecoveryByIdentity.has(
-      `${latch.worktreeId}\0${makePaneKey(latch.tabId, latch.leafId)}`
-    )
-    const detached = this.detachedPreAllocatedLeaves.get(latch.ptyId)
-    const detachedRemains =
-      detached?.ptyId === latch.ptyId &&
-      detached.worktreeId === latch.worktreeId &&
-      detached.tabId === latch.tabId &&
-      detached.leafId === latch.leafId
-    const headlessRemains = this.headlessTerminals.has(latch.ptyId)
-    const recordRemains = this.ptysById.has(latch.ptyId)
-    if (
-      surfaceRemains ||
-      leafRemains ||
-      handleRemains ||
-      waiterRemains ||
-      archiveOperationRemains ||
-      sleepingWorktreeRemains ||
-      mutatingWorktreeRemains ||
-      terminalSleepStateRemains ||
-      paneRecoveryRemains ||
-      detachedRemains ||
-      headlessRemains ||
-      recordRemains
-    ) {
+    if (this.collectIdleTerminalReclaimResidue(slot.latch).kind !== 'clear') {
       return
     }
     // Why: ambiguity clears only after every captured residue vanished without reclaim action.
     this.idleTerminalReclaimReservationOrLatch = null
+  }
+
+  private collectIdleTerminalReclaimResidue(
+    latch: IdleTerminalReclaimAmbiguityLatch
+  ): IdleTerminalReclaimResidue {
+    const present = new Set<string>()
+    const unknown = new Set<string>()
+    const markPresent = (carrier: string): void => {
+      present.add(carrier)
+    }
+    const markUnknown = (carrier: string): void => {
+      unknown.add(carrier)
+    }
+    const leafKey = this.getLeafKey(latch.tabId, latch.leafId)
+
+    try {
+      const hasPty = this.ptyController?.hasPty
+      if (!hasPty) {
+        markUnknown('provider-has-pty-unavailable')
+      } else {
+        const providerHasPty = hasPty(latch.ptyId)
+        if (providerHasPty === true) {
+          markPresent('provider-pty')
+        } else if (providerHasPty !== false) {
+          markUnknown('provider-has-pty-unknown')
+        }
+      }
+    } catch {
+      markUnknown('provider-has-pty-failed')
+    }
+
+    const sshPty = parseAppSshPtyId(latch.ptyId)
+    if (sshPty) {
+      try {
+        const store = this.store
+        if (!store?.getSshRemotePtyLeases) {
+          markUnknown('ssh-lease-unavailable')
+        } else if (
+          store
+            .getSshRemotePtyLeases()
+            .some(
+              (lease) =>
+                (lease.state === 'attached' || lease.state === 'detached') &&
+                lease.targetId === sshPty.connectionId &&
+                lease.ptyId === sshPty.relayPtyId &&
+                lease.worktreeId === latch.worktreeId &&
+                lease.tabId === latch.tabId &&
+                lease.leafId === latch.leafId
+            )
+        ) {
+          markPresent('ssh-restorable-lease')
+        }
+      } catch {
+        markUnknown('ssh-lease-read-failed')
+      }
+    }
+
+    try {
+      const session = this.getWorkspaceSessionForWorktree(latch.worktreeId)
+      if (!session) {
+        markUnknown('durable-session-unavailable')
+      } else {
+        const persistedBindings = indexIdleEmptyTerminalReclaimPersistedBindings(
+          session,
+          () => true
+        )
+        if (!persistedBindings) {
+          markUnknown('durable-membership-unavailable')
+        } else if (persistedBindings.ambiguousPtyIds.has(latch.ptyId)) {
+          markUnknown('durable-membership-ambiguous')
+        } else {
+          const tabs = session.tabsByWorktree[latch.worktreeId]
+          if (tabs?.some((tab) => tab.id === latch.tabId && tab.ptyId === latch.ptyId)) {
+            markPresent('durable-tab-pty')
+          }
+          if (
+            session.terminalLayoutsByTabId[latch.tabId]?.ptyIdsByLeafId?.[latch.leafId] ===
+            latch.ptyId
+          ) {
+            markPresent('durable-layout-pty')
+          }
+          if (session.remoteSessionIdsByTabId?.[latch.tabId] === latch.ptyId) {
+            markPresent('durable-remote-session-pty')
+          }
+          if (
+            session.terminalPtyIncarnationsByPaneKey?.[makePaneKey(latch.tabId, latch.leafId)] ===
+            latch.claimIncarnationId
+          ) {
+            markPresent('durable-pane-incarnation')
+          }
+        }
+      }
+    } catch {
+      markUnknown('durable-membership-read-failed')
+    }
+
+    try {
+      const matchingMobileTabs =
+        this.mobileSessionTabsByWorktree
+          .get(latch.worktreeId)
+          ?.tabs.filter(
+            (tab): tab is RuntimeMobileSessionTerminalTab =>
+              tab.type === 'terminal' &&
+              tab.parentTabId === latch.tabId &&
+              tab.leafId === latch.leafId
+          ) ?? []
+      if (matchingMobileTabs.some((tab) => tab.ptyId === latch.ptyId)) {
+        markPresent('mobile-session-direct-pty')
+      }
+      if (
+        matchingMobileTabs.some(
+          (tab) => tab.parentLayout?.ptyIdsByLeafId?.[latch.leafId] === latch.ptyId
+        )
+      ) {
+        markPresent('mobile-session-layout-pty')
+      }
+    } catch {
+      markUnknown('mobile-session-surface-read-failed')
+    }
+
+    if (this.graphStatus !== 'ready') {
+      markUnknown('renderer-graph-unavailable')
+    } else {
+      try {
+        const leaf = this.leaves.get(leafKey)
+        if (
+          leaf?.ptyId === latch.ptyId &&
+          leaf.worktreeId === latch.worktreeId &&
+          leaf.tabId === latch.tabId &&
+          leaf.leafId === latch.leafId
+        ) {
+          markPresent('renderer-leaf')
+        }
+        if (
+          this.leavesByPtyId
+            .get(latch.ptyId)
+            ?.some(
+              (indexedLeaf) =>
+                indexedLeaf.ptyId === latch.ptyId &&
+                indexedLeaf.worktreeId === latch.worktreeId &&
+                indexedLeaf.tabId === latch.tabId &&
+                indexedLeaf.leafId === latch.leafId
+            )
+        ) {
+          markPresent('renderer-leaves-by-pty')
+        }
+      } catch {
+        markUnknown('renderer-leaf-read-failed')
+      }
+    }
+
+    try {
+      const matchingHandles = new Set<string>()
+      const ptyAliasHandle = this.handleByPtyId.get(latch.ptyId)
+      if (ptyAliasHandle) {
+        matchingHandles.add(ptyAliasHandle)
+        markPresent('pty-handle-alias')
+      }
+      const leafAliasHandle = this.handleByLeafKey.get(leafKey)
+      if (leafAliasHandle && this.handles.get(leafAliasHandle)?.ptyId === latch.ptyId) {
+        matchingHandles.add(leafAliasHandle)
+        markPresent('leaf-handle-alias')
+      }
+      for (const [handle, record] of this.handles) {
+        if (record.ptyId === latch.ptyId) {
+          matchingHandles.add(handle)
+          markPresent('terminal-handle')
+        }
+      }
+      for (const handle of matchingHandles) {
+        if ((this.waitersByHandle.get(handle)?.size ?? 0) > 0) {
+          markPresent('terminal-handle-waiter')
+        }
+      }
+    } catch {
+      markUnknown('terminal-handle-read-failed')
+    }
+
+    try {
+      const detached = this.detachedPreAllocatedLeaves.get(latch.ptyId)
+      if (
+        detached?.ptyId === latch.ptyId &&
+        detached.worktreeId === latch.worktreeId &&
+        detached.tabId === latch.tabId &&
+        detached.leafId === latch.leafId
+      ) {
+        markPresent('detached-leaf')
+      }
+      if (this.headlessTerminals.has(latch.ptyId)) {
+        markPresent('headless-terminal')
+      }
+      if (this.headlessHydrationState.has(latch.ptyId)) {
+        markPresent('headless-hydration')
+      }
+      const record = this.ptysById.get(latch.ptyId)
+      if (
+        record &&
+        (record.incarnationId === null || record.incarnationId === latch.claimIncarnationId)
+      ) {
+        markPresent('pty-runtime-record')
+      }
+    } catch {
+      markUnknown('runtime-record-read-failed')
+    }
+
+    try {
+      if (this.reclaimInFlightByPtyId.has(latch.ptyId)) {
+        markPresent('reclaim-in-flight')
+      }
+      if (
+        [...this.headlessTerminalArchiveByOperationId.keys()].some(
+          (operationId) => /^user-close:([^:]+):/.exec(operationId)?.[1] === latch.tabId
+        )
+      ) {
+        markPresent('headless-archive-transaction')
+      }
+      if (this.terminalSleepByWorktreeId.has(latch.worktreeId)) {
+        markPresent('worktree-terminal-sleep')
+      }
+      if (this.terminalMutationTailByWorktreeId.has(runtimeWorktreeIdentityKey(latch.worktreeId))) {
+        markPresent('worktree-terminal-mutation')
+      }
+      const terminalSleepState = this.terminalSleepStateByWorktreeId.get(
+        runtimeWorktreeIdentityKey(latch.worktreeId)
+      )
+      if (
+        terminalSleepState?.ptyIds.includes(latch.ptyId) ||
+        terminalSleepState?.terminalHandlesByPtyId[latch.ptyId] !== undefined
+      ) {
+        markPresent('worktree-terminal-sleep-state')
+      }
+      if (
+        this.terminalPaneRecoveryByIdentity.has(
+          `${latch.worktreeId}\0${makePaneKey(latch.tabId, latch.leafId)}`
+        )
+      ) {
+        markPresent('terminal-pane-recovery')
+      }
+    } catch {
+      markUnknown('terminal-transaction-read-failed')
+    }
+
+    if (unknown.size > 0) {
+      return { kind: 'unknown', reasons: [...unknown].sort() }
+    }
+    if (present.size > 0) {
+      return { kind: 'present', classes: [...present].sort() }
+    }
+    return { kind: 'clear' }
   }
 
   // Why: toMobileSessionTabsResult resolves handles/titles from this.tabs and

@@ -73,7 +73,7 @@ function persistedTerminalTab(): TerminalTab {
 }
 
 function runtimeOwnedPersistedTerminalTab(): TerminalTab {
-  return { ...persistedTerminalTab(), id: RUNTIME_TAB_ID, ptyId: 'pty-runtime' }
+  return { ...persistedTerminalTab(), id: RUNTIME_TAB_ID, ptyId: 'serve-runtime' }
 }
 
 function fullyEligibleCandidate(): IdleEmptyTerminalReclaimCandidate {
@@ -91,6 +91,7 @@ function fullyEligibleCandidate(): IdleEmptyTerminalReclaimCandidate {
     hasSharedPty: false,
     isPersisted: false,
     rendererOwnsPersistedTab: false,
+    authoritativePersistedOwner: null,
     origin: 'cli',
     used: false,
     isPinned: false,
@@ -142,6 +143,7 @@ function expectedCollectedCandidate(args: {
     hasSharedPty: false,
     isPersisted: false,
     rendererOwnsPersistedTab: false,
+    authoritativePersistedOwner: null,
     origin: 'cli',
     used: false,
     isPinned: null,
@@ -193,7 +195,8 @@ function withCollectedTopologyFacts(
     hasExactTabLeafPtyWorktreeBinding: candidate.hasExactTabLeafPtyWorktreeBinding,
     hasSharedPty: candidate.hasSharedPty,
     isPersisted: candidate.isPersisted,
-    rendererOwnsPersistedTab: candidate.rendererOwnsPersistedTab
+    rendererOwnsPersistedTab: candidate.rendererOwnsPersistedTab,
+    authoritativePersistedOwner: candidate.authoritativePersistedOwner
   }
 }
 
@@ -248,7 +251,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
       root: { type: 'leaf', leafId: RUNTIME_LEAF_ID },
       activeLeafId: RUNTIME_LEAF_ID,
       expandedLeafId: null,
-      ptyIdsByLeafId: { [RUNTIME_LEAF_ID]: 'pty-runtime' }
+      ptyIdsByLeafId: { [RUNTIME_LEAF_ID]: 'serve-runtime' }
     }
     const runtime = new OrcaRuntimeService(makeStore(true, session) as never)
     const internals = runtime as unknown as RuntimeIdleReclaimInternals
@@ -282,8 +285,23 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
       ptyId: 'pty-renderer',
       writable: true
     })
+    internals.tabs.set(RUNTIME_TAB_ID, {
+      tabId: RUNTIME_TAB_ID,
+      worktreeId: WORKTREE_ID,
+      title: null,
+      activeLeafId: RUNTIME_LEAF_ID,
+      layout: { type: 'leaf', leafId: RUNTIME_LEAF_ID },
+      rendererVisibility: 'hidden'
+    })
+    internals.leaves.set(`${RUNTIME_TAB_ID}::${RUNTIME_LEAF_ID}`, {
+      tabId: RUNTIME_TAB_ID,
+      leafId: RUNTIME_LEAF_ID,
+      worktreeId: WORKTREE_ID,
+      ptyId: 'serve-runtime',
+      writable: true
+    })
 
-    const runtimePty = internals.recordPtyWorktree('pty-runtime', WORKTREE_ID, {
+    const runtimePty = internals.recordPtyWorktree('serve-runtime', WORKTREE_ID, {
       connected: true,
       incarnationId: 'runtime-incarnation',
       tabId: RUNTIME_TAB_ID,
@@ -312,6 +330,10 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
           isSinglePane: true,
           isPersisted: true,
           rendererOwnsPersistedTab: true,
+          authoritativePersistedOwner: {
+            kind: 'renderer',
+            source: 'ready-exact-renderer-binding'
+          },
           isPinned: false,
           isSleepingOrHibernating: false,
           providerWritable: true
@@ -320,14 +342,17 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
       expectedCollectedCandidate({
         tabId: RUNTIME_TAB_ID,
         leafId: RUNTIME_LEAF_ID,
-        ptyId: 'pty-runtime',
+        ptyId: 'serve-runtime',
         incarnationId: 'runtime-incarnation',
         lastActivityAt: runtimePty.lastActivityAt,
         overrides: {
           isSinglePane: true,
           isPersisted: true,
+          rendererOwnsPersistedTab: true,
+          authoritativePersistedOwner: { kind: 'runtime', source: 'serve-or-ssh-pty-id' },
           isPinned: false,
           isSleepingOrHibernating: false,
+          providerWritable: true,
           rendererVisibility: 'hidden'
         }
       }),
@@ -660,13 +685,10 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
   })
 
   it('reports an in-flight worktree terminal mutation instead of assuming false', async () => {
+    const mutationWorktreeId = 'repo-mutation::/tmp/idle-empty-terminal-reclaim-mutation'
     const runtime = new OrcaRuntimeService(makeStore(true) as never)
     const internals = runtime as unknown as RuntimeIdleReclaimInternals
     internals.graphStatus = 'ready'
-    const mutationInternals = internals as unknown as {
-      terminalMutationTailByWorktreeId: Map<string, Promise<void>>
-    }
-    mutationInternals.terminalMutationTailByWorktreeId.set(WORKTREE_ID, Promise.resolve())
     runtime.setPtyController({
       spawn: vi.fn(),
       write: vi.fn(() => true),
@@ -674,7 +696,7 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
       getForegroundProcess: vi.fn(async () => 'zsh'),
       inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
     })
-    const pty = internals.recordPtyWorktree('pty-mutating', WORKTREE_ID, {
+    const pty = internals.recordPtyWorktree('pty-mutating', mutationWorktreeId, {
       connected: true,
       incarnationId: 'mutation-incarnation',
       tabId: HOT_TAB_ID,
@@ -682,9 +704,40 @@ describe('OrcaRuntimeService idle empty-terminal reclaim wiring', () => {
     })
     pty.creationOrigin = 'cli'
 
+    const releaseMutation = await runtime.acquireWorktreeTerminalSpawn(mutationWorktreeId)
     const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
 
     expect(candidate?.hasInFlightTransaction).toBe(true)
+    releaseMutation()
+    runtime.dispose()
+  })
+
+  it('does not mistake a bare worktree id for a production mutation key', async () => {
+    const mutationWorktreeId = 'repo-mutation::/tmp/idle-empty-terminal-reclaim-mutation'
+    const runtime = new OrcaRuntimeService(makeStore(true) as never)
+    const internals = runtime as unknown as RuntimeIdleReclaimInternals & {
+      terminalMutationTailByWorktreeId: Map<string, Promise<void>>
+    }
+    internals.graphStatus = 'ready'
+    internals.terminalMutationTailByWorktreeId.set(mutationWorktreeId, Promise.resolve())
+    runtime.setPtyController({
+      spawn: vi.fn(),
+      write: vi.fn(() => true),
+      kill: vi.fn(() => true),
+      getForegroundProcess: vi.fn(async () => 'zsh'),
+      inspectProcess: vi.fn(async () => ({ foregroundProcess: 'zsh', hasChildProcesses: false }))
+    })
+    const pty = internals.recordPtyWorktree('pty-bare-mutation-key', mutationWorktreeId, {
+      connected: true,
+      incarnationId: 'bare-mutation-incarnation',
+      tabId: HOT_TAB_ID,
+      paneKey: `${HOT_TAB_ID}:${HOT_LEAF_ID}`
+    })
+    pty.creationOrigin = 'cli'
+
+    const [candidate] = await internals.collectIdleEmptyTerminalReclaimCandidates()
+
+    expect(candidate?.hasInFlightTransaction).toBe(false)
     runtime.dispose()
   })
 

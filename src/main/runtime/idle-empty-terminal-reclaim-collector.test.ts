@@ -22,6 +22,7 @@ function candidateSnapshot(
     hasSharedPty: false,
     isPersisted: true,
     rendererOwnsPersistedTab: true,
+    authoritativePersistedOwner: { kind: 'renderer', source: 'ready-exact-renderer-binding' },
     origin: 'cli',
     used: false,
     isPinned: false,
@@ -65,11 +66,19 @@ describe('collectIdleEmptyTerminalReclaimCandidates', () => {
     },
     {
       shape: 'runtime-owned persisted',
-      snapshot: candidateSnapshot({ isPersisted: true, rendererOwnsPersistedTab: false })
+      snapshot: candidateSnapshot({
+        isPersisted: true,
+        rendererOwnsPersistedTab: false,
+        authoritativePersistedOwner: { kind: 'runtime', source: 'serve-or-ssh-pty-id' }
+      })
     },
     {
       shape: 'hot-only',
-      snapshot: candidateSnapshot({ isPersisted: false, rendererOwnsPersistedTab: false })
+      snapshot: candidateSnapshot({
+        isPersisted: false,
+        rendererOwnsPersistedTab: false,
+        authoritativePersistedOwner: null
+      })
     }
   ])('collects the $shape tab shape without changing ownership facts', async ({ snapshot }) => {
     const candidates = await collectIdleEmptyTerminalReclaimCandidates(
@@ -82,7 +91,13 @@ describe('collectIdleEmptyTerminalReclaimCandidates', () => {
 
   it('collects a hot-only PTY with no session row as hot-only', async () => {
     const [candidate] = await collectIdleEmptyTerminalReclaimCandidates(
-      [candidateSnapshot({ isPersisted: false, rendererOwnsPersistedTab: false })],
+      [
+        candidateSnapshot({
+          isPersisted: false,
+          rendererOwnsPersistedTab: false,
+          authoritativePersistedOwner: null
+        })
+      ],
       async () => successfulInspection
     )
 
@@ -96,11 +111,16 @@ describe('collectIdleEmptyTerminalReclaimCandidates', () => {
   it('preserves contradictory and unknown ownership as refusing null facts', async () => {
     const candidates = await collectIdleEmptyTerminalReclaimCandidates(
       [
-        candidateSnapshot({ isPersisted: false, rendererOwnsPersistedTab: true }),
+        candidateSnapshot({
+          isPersisted: false,
+          rendererOwnsPersistedTab: true,
+          authoritativePersistedOwner: null
+        }),
         candidateSnapshot({
           ptyId: 'pty-2',
           isPersisted: null,
           rendererOwnsPersistedTab: null,
+          authoritativePersistedOwner: null,
           isPinned: null,
           rendererVisibility: null
         })
