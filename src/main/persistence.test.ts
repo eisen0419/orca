@@ -7247,6 +7247,52 @@ describe('Store', () => {
     expect(existsSync(join(testState.dir, 'terminal-scrollback', `${ref}.bin`))).toBe(false)
   })
 
+  it('keeps a retired scrollback sidecar recoverable until the durable retirement receipt commits', async () => {
+    const store = await createStore()
+    store.addRepo(makeRepo({ id: 'remote-repo', connectionId: 'ssh-target-1' }))
+    const source = makeSessionWithTerminalBuffers()
+    store.setWorkspaceSession({
+      ...source,
+      activeRepoId: 'remote-repo',
+      activeWorktreeId: 'remote-repo::/remote',
+      activeTabId: 'remote-tab',
+      tabsByWorktree: { 'remote-repo::/remote': source.tabsByWorktree['remote-repo::/remote'] },
+      terminalLayoutsByTabId: { 'remote-tab': source.terminalLayoutsByTabId['remote-tab'] }
+    })
+    store.flushOrThrow()
+    const before = store.getWorkspaceSession()
+    const ref = before.terminalLayoutsByTabId['remote-tab']?.scrollbackRefsByLeafId?.[TEST_LEAF_2]
+    if (!ref) {
+      throw new Error('expected scrollback snapshot ref')
+    }
+    const retired = retireTerminalSurfaceFromPersistence(before, {
+      worktreeId: 'remote-repo::/remote',
+      parentTabId: 'remote-tab',
+      leafId: TEST_LEAF_2,
+      ptyId: 'remote-pty'
+    })
+
+    store.setWorkspaceSession(retired, undefined, {
+      deferTerminalScrollbackSnapshotCleanup: true
+    })
+    vi.spyOn(store, 'flushOrThrow').mockImplementationOnce(() => {
+      throw new Error('disk-full')
+    })
+    expect(() => store.flushOrThrow()).toThrow('disk-full')
+    store.restoreWorkspaceSessionAfterFailedFlush(before)
+    expect(store.getWorkspaceSession()).toBe(before)
+    expect(store.readTerminalScrollbackSnapshot(ref)).toBe('remote-scrollback')
+
+    store.setWorkspaceSession(retired, undefined, {
+      deferTerminalScrollbackSnapshotCleanup: true
+    })
+    store.flushOrThrow()
+    // A post-write readback failure still rolls back the original sidecar and session atomically.
+    store.restoreWorkspaceSessionAfterFailedFlush(before)
+    expect(store.getWorkspaceSession()).toBe(before)
+    expect(store.readTerminalScrollbackSnapshot(ref)).toBe('remote-scrollback')
+  })
+
   it('keeps an archive sidecar live when its active session reference is removed', async () => {
     const store = await createStore()
     const worktreeId = 'repo-1::/worktree'

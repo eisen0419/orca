@@ -62,6 +62,13 @@ export type RuntimeIdleReclaimInternals = {
     candidate: IdleEmptyTerminalReclaimCandidate,
     claim: { incarnationId: string; activityGeneration: number }
   ) => Promise<boolean>
+  reclaimPersistedIdleTerminal: (
+    candidate: IdleEmptyTerminalReclaimCandidate,
+    config: { enabled?: unknown; idleThresholdMs?: unknown }
+  ) => Promise<{
+    decision: ReturnType<typeof evaluateIdleReclaimCandidate>
+    reclaimed: boolean
+  } | null>
 }
 
 export function fullyEligibleHotCandidate(

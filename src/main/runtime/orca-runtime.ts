@@ -31,9 +31,12 @@ import {
 } from './idle-empty-terminal-reclaim'
 import type {
   IdleTerminalReclaimAmbiguityLatch,
+  IdleTerminalReclaimCapturedPostStopIdentity,
+  IdleTerminalReclaimPostStopRecord,
   IdleTerminalReclaimReconciliationSlot,
   IdleTerminalReclaimReservation
 } from './idle-terminal-reclaim-reconciliation-slot'
+import { decideIdleTerminalReclaimPostStopOutcome } from './idle-terminal-reclaim-reconciliation-slot'
 import {
   createTerminalTitleTracker,
   stripBrailleSpinnerGlyphs,
@@ -1004,6 +1007,8 @@ type RuntimeStore = {
   getGitHubCache: Store['getGitHubCache']
   getWorkspaceSession?: Store['getWorkspaceSession']
   setWorkspaceSession?: Store['setWorkspaceSession']
+  restoreWorkspaceSessionAfterFailedFlush?: Store['restoreWorkspaceSessionAfterFailedFlush']
+  commitDeferredTerminalScrollbackSnapshotCleanup?: Store['commitDeferredTerminalScrollbackSnapshotCleanup']
   createTerminalArchiveStore?: Store['createTerminalArchiveStore']
   readTerminalScrollbackSnapshot?: Store['readTerminalScrollbackSnapshot']
   flushOrThrow?: Store['flushOrThrow']
@@ -3217,14 +3222,16 @@ export class OrcaRuntimeService {
     const candidates = await this.collectIdleEmptyTerminalReclaimCandidates()
     const refusalCounts = new Map<IdleEmptyTerminalReclaimRefusalReason, number>()
     const eligibleCloseModes = new Map<string, number>()
+    const blockedByReconciliationSlot = new Map<string, number>()
     for (const candidate of candidates) {
       let decision = evaluateIdleReclaimCandidate(candidate, config, Date.now())
-      if (
-        candidate.isPersisted === false &&
-        candidate.rendererOwnsPersistedTab === false &&
-        (decision.eligible || decision.reason === 'final-confirmation-or-claim-missing')
-      ) {
-        const reclaim = await this.reclaimHotOnlyIdleTerminal(candidate, config)
+      if (decision.eligible || decision.reason === 'final-confirmation-or-claim-missing') {
+        const reclaim =
+          candidate.isPersisted === false && candidate.rendererOwnsPersistedTab === false
+            ? await this.reclaimHotOnlyIdleTerminal(candidate, config)
+            : candidate.isPersisted === true && candidate.authoritativePersistedOwner !== null
+              ? await this.reclaimPersistedIdleTerminal(candidate, config)
+              : null
         if (reclaim) {
           decision = reclaim.decision
         }
@@ -3237,13 +3244,23 @@ export class OrcaRuntimeService {
       } else {
         refusalCounts.set(decision.reason, (refusalCounts.get(decision.reason) ?? 0) + 1)
       }
+      if (this.idleTerminalReclaimReservationOrLatch) {
+        const mode = decision.eligible ? decision.closeMode : 'unclassified'
+        blockedByReconciliationSlot.set(mode, (blockedByReconciliationSlot.get(mode) ?? 0) + 1)
+      }
     }
     console.debug('[idle-empty-terminal-reclaim] tick decisions', {
       candidateCount: candidates.length,
       truncatedCandidateCount: this.idleEmptyTerminalReclaimTruncatedCandidateCount,
       refusalCounts: Object.fromEntries(refusalCounts),
       eligibleCount: [...eligibleCloseModes.values()].reduce((total, count) => total + count, 0),
-      eligibleCloseModes: Object.fromEntries(eligibleCloseModes)
+      eligibleCloseModes: Object.fromEntries(eligibleCloseModes),
+      reconciliationSlot: this.idleTerminalReclaimReservationOrLatch
+        ? this.idleTerminalReclaimReservationOrLatch.kind === 'ambiguity-latch'
+          ? 'latched'
+          : 'reserved'
+        : 'free',
+      blockedByReconciliationSlot: Object.fromEntries(blockedByReconciliationSlot)
     })
   }
 
@@ -3433,6 +3450,375 @@ export class OrcaRuntimeService {
         this.reclaimInFlightByPtyId.delete(ptyId)
       }
     }
+  }
+
+  private async reclaimPersistedIdleTerminal(
+    captured: IdleEmptyTerminalReclaimCandidate,
+    config: { enabled?: unknown; idleThresholdMs?: unknown }
+  ): Promise<{
+    decision: ReturnType<typeof evaluateIdleReclaimCandidate>
+    reclaimed: boolean
+  } | null> {
+    const ptyId = captured.ptyId
+    if (
+      !ptyId ||
+      typeof captured.expectedIncarnationId !== 'string' ||
+      typeof captured.expectedActivityGeneration !== 'number'
+    ) {
+      return null
+    }
+    const livePty = this.ptysById.get(ptyId)
+    if (
+      !livePty ||
+      livePty.incarnationId !== captured.expectedIncarnationId ||
+      livePty.activityGeneration !== captured.expectedActivityGeneration ||
+      this.reclaimInFlightByPtyId.has(ptyId)
+    ) {
+      return null
+    }
+    const claim = {
+      incarnationId: captured.expectedIncarnationId,
+      activityGeneration: captured.expectedActivityGeneration
+    }
+    this.reclaimInFlightByPtyId.set(ptyId, claim)
+    try {
+      const confirmed = await this.collectIdleEmptyTerminalReclaimConfirmation(captured)
+      if (!confirmed || !this.hasExactIdleEmptyTerminalReclaimClaim(captured, claim)) {
+        return {
+          decision: { eligible: false, reason: 'final-confirmation-or-claim-missing' },
+          reclaimed: false
+        }
+      }
+      confirmed.hasSecondConfirmation = true
+      confirmed.hasExactIdentityClaim = true
+      const decision = evaluateIdleReclaimCandidate(confirmed, config, Date.now())
+      if (
+        !decision.eligible ||
+        (decision.closeMode !== 'renderer-owned-persisted' &&
+          decision.closeMode !== 'runtime-owned-persisted')
+      ) {
+        return { decision, reclaimed: false }
+      }
+      return {
+        decision,
+        reclaimed: await this.retirePersistedIdleTerminal(confirmed, claim, decision.closeMode)
+      }
+    } catch {
+      return {
+        decision: { eligible: false, reason: 'final-confirmation-or-claim-missing' },
+        reclaimed: false
+      }
+    } finally {
+      if (this.reclaimInFlightByPtyId.get(ptyId) === claim) {
+        this.reclaimInFlightByPtyId.delete(ptyId)
+      }
+    }
+  }
+
+  private captureIdleTerminalReclaimIdentity(
+    candidate: IdleEmptyTerminalReclaimCandidate,
+    claim: { incarnationId: string; activityGeneration: number },
+    mode: 'renderer-owned-persisted' | 'runtime-owned-persisted'
+  ):
+    | (IdleTerminalReclaimCapturedPostStopIdentity & { capturedTopologyRevision: number | null })
+    | null {
+    const { ptyId, worktreeId, tabId, leafId } = candidate
+    if (
+      !ptyId ||
+      !worktreeId ||
+      !tabId ||
+      !leafId ||
+      !this.hasExactIdleEmptyTerminalReclaimClaim(candidate, claim)
+    ) {
+      return null
+    }
+    const record = this.ptysById.get(ptyId)
+    if (
+      !record ||
+      record.worktreeId !== worktreeId ||
+      record.tabId !== tabId ||
+      record.paneKey !== makePaneKey(tabId, leafId) ||
+      record.incarnationId !== claim.incarnationId ||
+      candidate.authoritativePersistedOwner?.kind !==
+        (mode === 'renderer-owned-persisted' ? 'renderer' : 'runtime')
+    ) {
+      return null
+    }
+    const session = this.getWorkspaceSessionForWorktree(worktreeId)
+    if (
+      !session ||
+      this.classifyIdleTerminalPersistedBinding(
+        {
+          ptyId,
+          worktreeId,
+          tabId,
+          leafId,
+          claimIncarnationId: claim.incarnationId,
+          recordIdentity: record
+        },
+        session
+      ) !== 'present'
+    ) {
+      return null
+    }
+    const revision =
+      session?.terminalTopologyRevisionByRepoId?.[getRepoIdFromWorktreeId(worktreeId)]
+    return {
+      ptyId,
+      worktreeId,
+      tabId,
+      leafId,
+      claimIncarnationId: claim.incarnationId,
+      recordIdentity: record,
+      capturedTopologyRevision: typeof revision === 'number' ? revision : null
+    }
+  }
+
+  private readIdleTerminalReclaimPostStopRecord(
+    ptyId: string
+  ): IdleTerminalReclaimPostStopRecord | null {
+    const record = this.ptysById.get(ptyId)
+    if (!record) {
+      return null
+    }
+    const pane = parsePaneKey(record.paneKey ?? '')
+    return {
+      recordIdentity: record,
+      ptyId: record.ptyId,
+      worktreeId: record.worktreeId,
+      tabId: record.tabId,
+      leafId: pane?.leafId ?? null,
+      incarnationId: record.incarnationId,
+      connected: record.connected
+    }
+  }
+
+  private async retirePersistedIdleTerminal(
+    candidate: IdleEmptyTerminalReclaimCandidate,
+    claim: { incarnationId: string; activityGeneration: number },
+    mode: 'renderer-owned-persisted' | 'runtime-owned-persisted'
+  ): Promise<boolean> {
+    const identity = this.captureIdleTerminalReclaimIdentity(candidate, claim, mode)
+    const controller = this.ptyController
+    if (
+      !identity ||
+      !controller?.hasPty ||
+      !controller.stopAndWait ||
+      controller.hasPty(identity.ptyId) !== true
+    ) {
+      return false
+    }
+    const reservation = this.acquireIdleTerminalReclaimReservation()
+    if (!reservation) {
+      return false
+    }
+    let latchRetained = false
+    const retain = (reason: IdleTerminalReclaimAmbiguityLatch['reason']): false => {
+      this.retainIdleTerminalReclaimAmbiguityLatch(reservation, {
+        mode,
+        claimIncarnationId: identity.claimIncarnationId,
+        worktreeId: identity.worktreeId,
+        tabId: identity.tabId,
+        leafId: identity.leafId,
+        ptyId: identity.ptyId,
+        ownerKind: candidate.authoritativePersistedOwner?.kind ?? 'runtime',
+        capturedTopologyRevision: identity.capturedTopologyRevision,
+        createdAt: Date.now(),
+        reason
+      })
+      latchRetained = true
+      return false
+    }
+    try {
+      let stopResult: boolean | 'threw'
+      try {
+        // Point of no return: all owner, identity, persistence, and provider checks are above this stop.
+        stopResult = await controller.stopAndWait(identity.ptyId)
+      } catch {
+        stopResult = 'threw'
+      }
+      let providerHasPty: boolean | null
+      try {
+        providerHasPty = controller.hasPty(identity.ptyId)
+      } catch {
+        providerHasPty = null
+      }
+      const outcome = decideIdleTerminalReclaimPostStopOutcome({
+        stopResult,
+        providerHasPty,
+        captured: identity,
+        current: this.readIdleTerminalReclaimPostStopRecord(identity.ptyId)
+      })
+      if (outcome === 'release-no-stop' || outcome === 'release-replacement') {
+        return false
+      }
+      if (outcome === 'retain-ambiguity') {
+        return retain(
+          stopResult === 'threw'
+            ? 'stop-threw'
+            : providerHasPty === null
+              ? 'provider-state-unknown'
+              : this.ptysById.get(identity.ptyId)?.incarnationId === null
+                ? 'post-stop-identity-null'
+                : 'same-incarnation-unstable'
+        )
+      }
+      const receipt = this.retireIdleTerminalPersistedSurface(identity)
+      if (receipt === 'durably-retired' || receipt === 'already-durably-retired') {
+        return true
+      }
+      if (receipt === 'replacement-present') {
+        return false
+      }
+      return retain(
+        receipt === 'persist-failed' ? 'persistence-flush-failed' : 'persistence-unavailable'
+      )
+    } finally {
+      if (!latchRetained) {
+        this.releaseIdleTerminalReclaimReservation(reservation)
+      }
+    }
+  }
+
+  private retireIdleTerminalPersistedSurface(
+    identity: IdleTerminalReclaimCapturedPostStopIdentity & {
+      capturedTopologyRevision: number | null
+    }
+  ):
+    | 'durably-retired'
+    | 'already-durably-retired'
+    | 'replacement-present'
+    | 'unavailable-or-ambiguous'
+    | 'persist-failed' {
+    const session = this.getWorkspaceSessionForWorktree(identity.worktreeId)
+    const store = this.store
+    if (
+      !session ||
+      !store?.setWorkspaceSession ||
+      !store.restoreWorkspaceSessionAfterFailedFlush ||
+      !store.flushOrThrow
+    ) {
+      return 'unavailable-or-ambiguous'
+    }
+    const repoId = getRepoIdFromWorktreeId(identity.worktreeId)
+    const bindingState = this.classifyIdleTerminalPersistedBinding(identity, session)
+    if (bindingState === 'replacement-present') {
+      return 'replacement-present'
+    }
+    const revision = session.terminalTopologyRevisionByRepoId?.[repoId] ?? 0
+    if (bindingState === 'absent') {
+      if (
+        identity.capturedTopologyRevision === null ||
+        revision <= identity.capturedTopologyRevision
+      ) {
+        return 'unavailable-or-ambiguous'
+      }
+      this.publishIdleTerminalPersistedSurfaceAbsence(identity)
+      return 'already-durably-retired'
+    }
+    const next = retireTerminalSurfaceFromPersistence(session, {
+      worktreeId: identity.worktreeId,
+      parentTabId: identity.tabId,
+      leafId: identity.leafId,
+      ptyId: identity.ptyId,
+      incarnationId: identity.claimIncarnationId
+    })
+    if (next === session) {
+      return 'unavailable-or-ambiguous'
+    }
+    try {
+      store.setWorkspaceSession(
+        next,
+        this.getWorkspaceSessionHostIdForWorktree(identity.worktreeId),
+        {
+          deferTerminalScrollbackSnapshotCleanup: true
+        }
+      )
+      store.flushOrThrow()
+    } catch (error) {
+      store.restoreWorkspaceSessionAfterFailedFlush(
+        session,
+        this.getWorkspaceSessionHostIdForWorktree(identity.worktreeId)
+      )
+      console.error(
+        '[idle-empty-terminal-reclaim] failed to persist exact terminal retirement:',
+        error
+      )
+      return 'persist-failed'
+    }
+    const reread = this.getWorkspaceSessionForWorktree(identity.worktreeId)
+    const rereadRevision = reread?.terminalTopologyRevisionByRepoId?.[repoId] ?? 0
+    const rereadBindingState = reread
+      ? this.classifyIdleTerminalPersistedBinding(identity, reread)
+      : 'present'
+    if (rereadBindingState === 'replacement-present') {
+      return 'replacement-present'
+    }
+    if (
+      !reread ||
+      rereadBindingState !== 'absent' ||
+      rereadRevision <= revision ||
+      (identity.capturedTopologyRevision !== null &&
+        rereadRevision <= identity.capturedTopologyRevision)
+    ) {
+      store.restoreWorkspaceSessionAfterFailedFlush(
+        session,
+        this.getWorkspaceSessionHostIdForWorktree(identity.worktreeId)
+      )
+      return 'persist-failed'
+    }
+    this.publishIdleTerminalPersistedSurfaceAbsence(identity)
+    store.commitDeferredTerminalScrollbackSnapshotCleanup?.()
+    return 'durably-retired'
+  }
+
+  private classifyIdleTerminalPersistedBinding(
+    identity: IdleTerminalReclaimCapturedPostStopIdentity,
+    session: WorkspaceSessionState
+  ): 'present' | 'absent' | 'replacement-present' {
+    const paneKey = makePaneKey(identity.tabId, identity.leafId)
+    const layoutPtyId =
+      session.terminalLayoutsByTabId[identity.tabId]?.ptyIdsByLeafId?.[identity.leafId] ?? null
+    const tabPtyId =
+      session.tabsByWorktree[identity.worktreeId]?.find((tab) => tab.id === identity.tabId)
+        ?.ptyId ?? null
+    const remoteSessionPtyId = session.remoteSessionIdsByTabId?.[identity.tabId] ?? null
+    const paneIncarnationId = session.terminalPtyIncarnationsByPaneKey?.[paneKey] ?? null
+    if (
+      [layoutPtyId, tabPtyId, remoteSessionPtyId].some(
+        (ptyId) => ptyId !== null && ptyId !== identity.ptyId
+      ) ||
+      (paneIncarnationId !== null && paneIncarnationId !== identity.claimIncarnationId)
+    ) {
+      return 'replacement-present'
+    }
+    return [layoutPtyId, tabPtyId, remoteSessionPtyId, paneIncarnationId].some(
+      (value) => value !== null
+    )
+      ? 'present'
+      : 'absent'
+  }
+
+  private publishIdleTerminalPersistedSurfaceAbsence(
+    identity: Pick<
+      IdleTerminalReclaimCapturedPostStopIdentity,
+      'worktreeId' | 'tabId' | 'leafId' | 'ptyId'
+    >
+  ): void {
+    const snapshot = this.mobileSessionTabsByWorktree.get(identity.worktreeId)
+    const retired = snapshot
+      ? retireTerminalSurfacesFromSnapshot({
+          snapshot,
+          ptyId: identity.ptyId,
+          exactSurfaces: [{ parentTabId: identity.tabId, leafId: identity.leafId }],
+          exactOnly: true
+        })
+      : null
+    if (!retired) {
+      return
+    }
+    this.mobileSessionTabsByWorktree.set(identity.worktreeId, retired.snapshot)
+    this.notifyMobileSessionTabsChanged(identity.worktreeId)
   }
 
   private async collectIdleEmptyTerminalReclaimConfirmation(
@@ -3625,6 +4011,17 @@ export class OrcaRuntimeService {
   ): void {
     if (this.idleTerminalReclaimReservationOrLatch === reservation) {
       this.idleTerminalReclaimReservationOrLatch = { kind: 'ambiguity-latch', latch }
+      console.warn('[idle-empty-terminal-reclaim] ambiguity latch retained', {
+        mode: latch.mode,
+        reason: latch.reason,
+        worktreeId: latch.worktreeId,
+        tabId: latch.tabId,
+        leafId: latch.leafId,
+        ptyId: latch.ptyId,
+        claimIncarnationId: latch.claimIncarnationId,
+        ownerKind: latch.ownerKind,
+        createdAt: latch.createdAt
+      })
     }
   }
 
@@ -4160,7 +4557,10 @@ export class OrcaRuntimeService {
       providerConnected: null,
       providerWritable:
         rendererLeaf?.writable ??
-        (isPersisted === false && rendererOwnsPersistedTab === false ? pty.connected : null),
+        ((isPersisted === false || authoritativePersistedOwner?.kind === 'runtime') &&
+        rendererOwnsPersistedTab === false
+          ? pty.connected
+          : null),
       rendererVisibility,
       hasMobileDriver: this.getDriver(pty.ptyId).kind === 'mobile',
       hasMobileSubscriber,
@@ -5449,6 +5849,14 @@ export class OrcaRuntimeService {
     }
     // Why: ambiguity clears only after every captured residue vanished without reclaim action.
     this.idleTerminalReclaimReservationOrLatch = null
+    console.info('[idle-empty-terminal-reclaim] ambiguity latch naturally released', {
+      mode: slot.latch.mode,
+      worktreeId: slot.latch.worktreeId,
+      tabId: slot.latch.tabId,
+      leafId: slot.latch.leafId,
+      ptyId: slot.latch.ptyId,
+      ageMs: Math.max(0, Date.now() - slot.latch.createdAt)
+    })
   }
 
   private collectIdleTerminalReclaimResidue(

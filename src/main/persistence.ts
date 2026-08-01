@@ -2660,25 +2660,30 @@ function backfillFolderScopeConnectionIds(state: PersistedState): {
   }
 }
 
-function deleteRemovedTerminalScrollbackSnapshots(
+function collectRemovedTerminalScrollbackSnapshots(
   prior: WorkspaceSessionState | undefined,
   next: WorkspaceSessionState,
-  storage?: TerminalScrollbackSnapshotStorage,
   protectedRefs: ReadonlySet<string> = new Set()
-): void {
+): Set<string> {
+  const removed = new Set<string>()
   if (!prior) {
-    return
+    return removed
   }
   const nextRefs = collectTerminalScrollbackSnapshotRefs(next)
   for (const ref of collectTerminalScrollbackSnapshotRefs(prior)) {
     if (!nextRefs.has(ref) && !protectedRefs.has(ref)) {
-      deleteTerminalScrollbackSnapshotSync(ref, storage)
+      removed.add(ref)
     }
   }
+  return removed
 }
 
 export type StoreOptions = {
   dataFile?: string
+}
+
+export type SetWorkspaceSessionOptions = {
+  deferTerminalScrollbackSnapshotCleanup?: boolean
 }
 
 export type TerminalArchivePaneDurableTransferResult =
@@ -2691,6 +2696,8 @@ export class Store {
   private readonly dataFile: string
   private readonly activeViewPreference: ActiveViewPreference
   private readonly terminalScrollbackSnapshotStorage: TerminalScrollbackSnapshotStorage
+  // Why: a session write is not durable until flush succeeds, so sidecars must outlive rollback.
+  private deferredTerminalScrollbackSnapshotCleanup = new Set<string>()
   private writeTimer: ReturnType<typeof setTimeout> | null = null
   private pendingWrite: Promise<void> | null = null
   private writeGeneration = 0
@@ -5937,13 +5944,48 @@ export class Store {
     return findWorktreeIdForTab(this.getWorkspaceSession(), tabId)
   }
 
-  setWorkspaceSession(session: PersistedState['workspaceSession'], hostId?: string | null): void {
+  setWorkspaceSession(
+    session: PersistedState['workspaceSession'],
+    hostId?: string | null,
+    options: SetWorkspaceSessionOptions = {}
+  ): void {
     const resolved = this.resolveHostId(hostId)
     if (resolved === LOCAL_EXECUTION_HOST_ID) {
-      this.setLocalWorkspaceSession(session)
+      this.setLocalWorkspaceSession(session, options)
       return
     }
     this.setHostWorkspaceSession(resolved, session)
+  }
+
+  /** Restore the exact pre-transaction partition after a synchronous flush failure. */
+  restoreWorkspaceSessionAfterFailedFlush(
+    session: PersistedState['workspaceSession'],
+    hostId?: string | null
+  ): void {
+    const resolved = this.resolveHostId(hostId)
+    if (resolved === LOCAL_EXECUTION_HOST_ID) {
+      this.state.workspaceSession = session
+      this.deferredTerminalScrollbackSnapshotCleanup.clear()
+    } else {
+      this.state.workspaceSessionsByHostId = {
+        ...this.state.workspaceSessionsByHostId,
+        [resolved]: session
+      }
+    }
+    this.scheduleSave()
+  }
+
+  /** Commit sidecar cleanup only after a caller has verified its durable workspace-session receipt. */
+  commitDeferredTerminalScrollbackSnapshotCleanup(): void {
+    const localSession = this.state.workspaceSession
+    const liveRefs = localSession ? collectTerminalScrollbackSnapshotRefs(localSession) : new Set()
+    const protectedRefs = this.getTerminalScrollbackRefsOutsideLocalSession()
+    for (const ref of this.deferredTerminalScrollbackSnapshotCleanup) {
+      if (!liveRefs.has(ref) && !protectedRefs.has(ref)) {
+        deleteTerminalScrollbackSnapshotSync(ref, this.terminalScrollbackSnapshotStorage)
+      }
+    }
+    this.deferredTerminalScrollbackSnapshotCleanup.clear()
   }
 
   /** Retires a tab and records SSH termination intent in one durable mutation before kill authority escapes. */
@@ -6047,7 +6089,10 @@ export class Store {
     this.scheduleSave()
   }
 
-  private setLocalWorkspaceSession(session: PersistedState['workspaceSession']): void {
+  private setLocalWorkspaceSession(
+    session: PersistedState['workspaceSession'],
+    options: SetWorkspaceSessionOptions
+  ): void {
     const prior = this.state.workspaceSession
     session = reseedMainOwnedPtyIncarnations(session, prior)
     session = sanitizeWorkspaceSessionTerminalRetirements(session, prior)
@@ -6183,12 +6228,18 @@ export class Store {
       this.terminalScrollbackSnapshotStorage
     )
     session = migratedScrollback.session
-    deleteRemovedTerminalScrollbackSnapshots(
+    const pendingSnapshotCleanup = collectRemovedTerminalScrollbackSnapshots(
       prior,
       session,
-      this.terminalScrollbackSnapshotStorage,
       this.getTerminalScrollbackRefsOutsideLocalSession()
     )
+    for (const ref of pendingSnapshotCleanup) {
+      if (options.deferTerminalScrollbackSnapshotCleanup) {
+        this.deferredTerminalScrollbackSnapshotCleanup.add(ref)
+      } else {
+        deleteTerminalScrollbackSnapshotSync(ref, this.terminalScrollbackSnapshotStorage)
+      }
+    }
     const incoming = session.terminalArchiveHintsByPaneKey ?? {}
     const incomingHasAnyHint = Object.keys(incoming).length > 0
     if (!incomingHasAnyHint && prior?.terminalArchiveHintsByPaneKey) {
